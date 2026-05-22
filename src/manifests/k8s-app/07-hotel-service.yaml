@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hotel-service
+  labels: { app: hotel-service }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: hotel-service }
+  template:
+    metadata:
+      labels: { app: hotel-service }
+    spec:
+      containers:
+        - name: hotel-service
+          image: src-hotel-service:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8082
+          env:
+            - name: POSTGRES_HOST
+              valueFrom: { configMapKeyRef: { name: app-config, key: POSTGRES_HOST } }
+            - name: POSTGRES_PORT
+              valueFrom: { configMapKeyRef: { name: app-config, key: POSTGRES_PORT } }
+            - name: POSTGRES_DB
+              value: hotels_db
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: app-secrets, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hotel-service
+  labels: { app: hotel-service }
+spec:
+  selector: { app: hotel-service }
+  ports:
+    - port: 8082
+      targetPort: 8082
+  type: ClusterIP

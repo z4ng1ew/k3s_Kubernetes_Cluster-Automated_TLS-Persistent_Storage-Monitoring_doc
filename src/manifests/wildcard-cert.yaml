@@ -1,0 +1,18 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-nipio
+  namespace: default
+spec:
+  secretName: wildcard-nipio-tls   
+  duration: 8760h                 
+  renewBefore: 720h               
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  dnsNames:
+    - "10.174.8.95.nip.io"         
+    - "*.10.174.8.95.nip.io"       
+  issuerRef:
+    name: my-ca-issuer             
+    kind: ClusterIssuer

@@ -1,0 +1,107 @@
+    Advanced_kubernetes
+    
+    Соблюдайте правила:
+
+1) Репозиторий содержит работу студента (или группы) в папке src ветки develop.
+2) Студент может объяснить свою работу в любое время во время проверки.
+3) В ходе проверки соблюдаются общие правила. Advanced_kubernetes:
+4) Отчет находится в папке src.
+5) Отчет имеет расширение .md.
+6) Все задачи выделены заголовками уровня 2.
+7) Все скриншоты в отчете снабжены подписями, описывающими показанное.
+8) Все скриншоты обрезаны, чтобы показать только соответствующую часть экрана.
+
+
+
+    1. Установка k3s
+
+1) Отчет содержит список команд для установки дистрибутива Kubernetes k3s на трех удаленных виртуальных машинах.
+2) Обратите внимание, что Kubernetes не содержит стандартный контроллер Ingress Traefik.
+
+    0 1 2 3 4 5
+
+
+
+    2. Настройка контроллера Ingress
+
+1) Контроллер Ingress на основе nginx настраивается в кластере.
+2) Отчет содержит его конфигурацию и команды, необходимые для настройки контроллера.
+
+    0 1 2 3 4 5
+
+
+
+    3. Kubernetes и тесты
+
+1) В Kubernetes создан постоянный том для базы данных PostgreSQL.
+2) Приложение развернуто в Kubernetes и доступно по адресу кластера.
+3) Предоставлены скриншоты результатов теста Postman.
+
+    0 1 2 3 4 5
+
+
+
+    4. Оператор Prometheus
+
+1) Отчет содержит описание запуска оператора Prometheus и скриншоты результатов.
+
+    0 1 2 3 4 5
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Advanced_kubernetes
+Respect the rules:
+
+The repository contains the student's (or group's) work in the src folder of the develop branch.
+The student can explain their work at any time during the review.
+General rules are observed throughout the review. Advanced_kubernetes:
+The report is in the src folder.
+The report has the .md extension.
+All tasks are highlighted as level 2 headers.
+All screenshots in the report are captioned to describe what is shown.
+All screenshots are cropped to show only the relevant part of the screen.
+k3s Installation
+The report contains a list of commands for installing the k3s Kubernetes distribution on three remote virtual machines.
+Note that Kubernetes does not contain the Traefik standard Ingress Controller.
+
+012345
+
+Configuring of the ingress controller
+The Ingress Controller based on nginx is configured on the cluster.
+The report contains its configuration and the commands needed to configure the Controller.
+
+012345
+
+Kubernetes and tests
+A persistent volume has been created in Kubernetes for the PostgreSQL database.
+The application has been deployed in Kubernetes and can be accessed at the cluster address.
+Screenshots of the Postman test results are provided.
+
+012345
+
+Prometeheus operator
+The report contains a description of how to run the Prometheus Operator and screenshots of the results.
+
+012345
+

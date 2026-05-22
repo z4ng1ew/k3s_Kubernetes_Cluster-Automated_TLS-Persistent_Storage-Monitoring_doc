@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booking-service
+  labels: { app: booking-service }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: booking-service }
+  template:
+    metadata:
+      labels: { app: booking-service }
+    spec:
+      containers:
+        - name: booking-service
+          image: src-booking-service:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8083
+          env:
+            - name: POSTGRES_HOST
+              valueFrom: { configMapKeyRef: { name: app-config, key: POSTGRES_HOST } }
+            - name: POSTGRES_PORT
+              valueFrom: { configMapKeyRef: { name: app-config, key: POSTGRES_PORT } }
+            - name: POSTGRES_DB
+              value: reservations_db
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: app-secrets, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD } }
+            - name: RABBIT_MQ_HOST
+              valueFrom: { configMapKeyRef: { name: app-config, key: RABBIT_MQ_HOST } }
+            - name: RABBIT_MQ_PORT
+              valueFrom: { configMapKeyRef: { name: app-config, key: RABBIT_MQ_PORT } }
+            - name: RABBIT_MQ_QUEUE_NAME
+              valueFrom: { configMapKeyRef: { name: app-config, key: RABBIT_MQ_QUEUE_NAME } }
+            - name: RABBIT_MQ_EXCHANGE
+              valueFrom: { configMapKeyRef: { name: app-config, key: RABBIT_MQ_EXCHANGE } }
+            - name: RABBIT_MQ_USER
+              valueFrom: { secretKeyRef: { name: app-secrets, key: RABBIT_MQ_USER } }
+            - name: RABBIT_MQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: app-secrets, key: RABBIT_MQ_PASSWORD } }
+            - name: HOTEL_SERVICE_HOST
+              valueFrom: { configMapKeyRef: { name: app-config, key: HOTEL_SERVICE_HOST } }
+            - name: HOTEL_SERVICE_PORT
+              valueFrom: { configMapKeyRef: { name: app-config, key: HOTEL_SERVICE_PORT } }
+            - name: PAYMENT_SERVICE_HOST
+              valueFrom: { configMapKeyRef: { name: app-config, key: PAYMENT_SERVICE_HOST } }
+            - name: PAYMENT_SERVICE_PORT
+              valueFrom: { configMapKeyRef: { name: app-config, key: PAYMENT_SERVICE_PORT } }
+            - name: LOYALTY_SERVICE_HOST
+              valueFrom: { configMapKeyRef: { name: app-config, key: LOYALTY_SERVICE_HOST } }
+            - name: LOYALTY_SERVICE_PORT
+              valueFrom: { configMapKeyRef: { name: app-config, key: LOYALTY_SERVICE_PORT } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: booking-service
+  labels: { app: booking-service }
+spec:
+  selector: { app: booking-service }
+  ports:
+    - port: 8083
+      targetPort: 8083
+  type: ClusterIP

@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loyalty-service
+  labels: { app: loyalty-service }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: loyalty-service }
+  template:
+    metadata:
+      labels: { app: loyalty-service }
+    spec:
+      containers:
+        - name: loyalty-service
+          image: src-loyalty-service:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8085
+          env:
+            - name: POSTGRES_HOST
+              valueFrom: { configMapKeyRef: { name: app-config, key: POSTGRES_HOST } }
+            - name: POSTGRES_PORT
+              valueFrom: { configMapKeyRef: { name: app-config, key: POSTGRES_PORT } }
+            - name: POSTGRES_DB
+              value: balances_db
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: app-secrets, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loyalty-service
+  labels: { app: loyalty-service }
+spec:
+  selector: { app: loyalty-service }
+  ports:
+    - port: 8085
+      targetPort: 8085
+  type: ClusterIP
