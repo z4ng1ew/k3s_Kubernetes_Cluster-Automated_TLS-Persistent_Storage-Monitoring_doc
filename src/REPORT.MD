@@ -799,6 +799,10 @@ Location: https://hello.10.174.8.95.nip.io
 
 **Все 8 образов собраны**
 
+
+
+
+
 ![alt text](<img/1/image copy 25.png>)
 
 **Все 9 образов на всех 3 ВМ**
@@ -808,58 +812,45 @@ Location: https://hello.10.174.8.95.nip.io
 
 
 
-## 1) В Kubernetes создан постоянный том для базы данных PostgreSQL. *
 
 
 
 
 ![alt text](<img/2/image copy 12.png>)
 
-```
-s@Vivo:~/DO-11/src/manifests/k8s-app$ cd ~/DO-11/src/manifests/k8s-app
-
-kubectl apply -f .
-configmap/app-config created
-secret/app-secrets created
-persistentvolume/postgres-pv created
-persistentvolumeclaim/postgres-pvc created
-deployment.apps/postgres created
-service/postgres created
-deployment.apps/rabbitmq created
-service/rabbitmq created
-deployment.apps/session-service created
-service/session-service created
-deployment.apps/hotel-service created
-service/hotel-service created
-deployment.apps/booking-service created
-service/booking-service created
-deployment.apps/payment-service created
-service/payment-service created
-deployment.apps/loyalty-service created
-service/loyalty-service created
-deployment.apps/report-service created
-service/report-service created
-deployment.apps/gateway-service created
-service/gateway-service created
-ingress.networking.k8s.io/app-ingress created
-s@Vivo:~/DO-11/src/manifests/k8s-app$ 
-```
 
 
-**это пункт 3.1 и 3.2 чек-листа — PV создан, приложение развёрнуто**
-
-
-
-## 2) Приложение развернуто в Kubernetes и доступно по адресу кластера. *
-
-
-![alt text](<img/2/image copy 13.png>)
-
-**kubectl get pods -w - Смотрим, как поды переходят в Running**
+**kubectl apply -f . создаёт все 13 манифестов сразу — и PV, и приложение, и Ingress**
 
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 1) В Kubernetes создан постоянный том для базы данных PostgreSQL. *
 
 
 
@@ -875,7 +866,7 @@ kubectl describe pvc postgres-pvc
 
 **Проверка PV**
 
-
+**PV `postgres-pv` (5Gi) в статусе Bound с PVC `postgres-pvc`. PostgreSQL использует этот том.**
 
 
 
@@ -891,31 +882,69 @@ kubectl describe pvc postgres-pvc
 
 
 
-```
-s@Vivo:~/DO-11/src/manifests/k8s-app$ kubectl exec -it deployment/postgres -- psql -U postgres -c '\l'
-                                    List of databases
-      Name       |  Owner   | Encoding |  Collate   |   Ctype    |   Access privileges   
------------------+----------+----------+------------+------------+-----------------------
- balances_db     | postgres | UTF8     | en_US.utf8 | en_US.utf8 | 
- hotels_db       | postgres | UTF8     | en_US.utf8 | en_US.utf8 | 
- payments_db     | postgres | UTF8     | en_US.utf8 | en_US.utf8 | 
- postgres        | postgres | UTF8     | en_US.utf8 | en_US.utf8 | 
- reservations_db | postgres | UTF8     | en_US.utf8 | en_US.utf8 | 
- statistics_db   | postgres | UTF8     | en_US.utf8 | en_US.utf8 | 
- template0       | postgres | UTF8     | en_US.utf8 | en_US.utf8 | =c/postgres          +
-                 |          |          |            |            | postgres=CTc/postgres
- template1       | postgres | UTF8     | en_US.utf8 | en_US.utf8 | =c/postgres          +
-                 |          |          |            |            | postgres=CTc/postgres
- users_db        | postgres | UTF8     | en_US.utf8 | en_US.utf8 | 
-(9 rows)
-
-s@Vivo:~/DO-11/src/manifests/k8s-app$ 
-```
-
-
-
 
 **Проверка, что БД создались**
+
+**После старта PostgreSQL автоматически создал 6 БД на постоянном томе — данные переживут перезапуск пода.**
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 2) Приложение развернуто в Kubernetes и доступно по адресу кластера. *
+
+
+![alt text](<img/2/image copy 13.png>)
+
+**kubectl get pods -w - Смотрим, как поды переходят в Running**
+
+**Все 9 подов микросервисов в статусе Running.**
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -931,13 +960,6 @@ s@Vivo:~/DO-11/src/manifests/k8s-app$
 
 ![alt text](<img/2/image copy 16.png>)
 
-```
-s@Vivo:~/DO-11/src/manifests/k8s-app$ kubectl get ingress
-NAME            CLASS   HOSTS                                                   ADDRESS       PORTS     AGE
-app-ingress     nginx   session.10.174.8.95.nip.io,gateway.10.174.8.95.nip.io   10.174.8.91   80, 443   6m29s
-hello-ingress   nginx   hello.10.174.8.95.nip.io                                10.174.8.91   80, 443   4h56m
-```
-
 **Проверка Ingress**
 
 
@@ -950,26 +972,6 @@ hello-ingress   nginx   hello.10.174.8.95.nip.io                                
 **Логин (вернул 200 + заголовок Authorization)**
 
 
-```
-s@Vivo:~/DO-11/src/manifests/k8s-app$ curl -k -i -H "Authorization: Basic VXNlcjpxd2VydHk=" \
-  https://session.10.174.8.95.nip.io/api/v1/auth/authorize
-HTTP/2 200 
-date: Fri, 22 May 2026 13:25:50 GMT
-content-length: 0
-vary: Origin
-vary: Access-Control-Request-Method
-vary: Access-Control-Request-Headers
-authorization: Bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiI2ZDJjYjVhMC05NDNjLTRiOTYtOWFhNi04OWVhYzdiZGZkMmIiLCJleHAiOjE3ODA2MTc2MDB9.CdagQ_s-hEhcC4tbWr2jbiiwXe1DFINsEKtMdhGy9Ke_xYQ0yDx4GrShoIY2ER1EgjYDYKPnMmOYb1f-Gtwg8aMj7efeGh92jO7jnCIRtNa6BAmj_Qe-rCnxzAmSGqeChyHC3s50rSWiGaPZq9QSsmED_KIHO4RVV26i-o_UceiXDSGrD-TZOSRRwk72o4ZV4g2AvYxHo-lBG6ymsnXd7ddW00k7IptD8iWUSMLIY5Rt3STFSP9QJNA7bX8XN5ks35Dbm0FAgXsgkE2bwM27z7pIgggyPzEej19uHbMgaktjEhMZO3hsf7hh-sc-o8KtnkQ_n5LZozg7afVE8P3ebQ
-access-control-expose-headers: authorization
-x-content-type-options: nosniff
-x-xss-protection: 1; mode=block
-cache-control: no-cache, no-store, max-age=0, must-revalidate
-pragma: no-cache
-expires: 0
-strict-transport-security: max-age=31536000; includeSubDomains
-x-frame-options: DENY
-```
-
 
 
 
@@ -977,16 +979,6 @@ x-frame-options: DENY
 ![alt text](<img/2/image copy 18.png>)
 
 **Список отелей (нужен валидный Bearer-токен из предыдущего запроса)**
-
-
-
-```
-s@Vivo:~/DO-11/src/manifests/k8s-app$ TOKEN=$(curl -ks -H "Authorization: Basic VXNlcjpxd2VydHk=" \
-  https://session.10.174.8.95.nip.io/api/v1/auth/authorize -D - | grep -i ^authorization | sed 's/[Aa]uthorization: //' | tr -d '\r')
-s@Vivo:~/DO-11/src/manifests/k8s-app$ curl -k -H "Authorization: $TOKEN" \
-  https://gateway.10.174.8.95.nip.io/api/v1/gateway/hotels
-[{"hotelUid":"9d05ba36-bf8d-11eb-8529-0242ac130003","name":"Hotel 1","location":{"country":"Country 1","city":"City 1","address":"Address 1"},"cost":2000.0},{"hotelUid":"ab84f4e6-bf8d-11eb-8529-0242ac130003","name":"Hotel 2","location":{"country":"Country 1","city":"City 2","address":"Address 2"},"cost":3000.0},{"hotelUid":"b0698102-bf8d-11eb-8529-0242ac130003","name":"Hotel 3","location":{"country":"Country 2","city":"City 3","address":"Address 3"},"cost":5000.0}]s@Vivo:~/DO-11/src/manifests/k8s-app$ 
-```
 
 
 
@@ -1021,66 +1013,15 @@ s@Vivo:~/DO-11/src/manifests/k8s-app$ curl -k -H "Authorization: $TOKEN" \
 
 **результаты - 200/201**
 
-```
-s@Vivo:~/DO-11/src$ cd ~/DO-11/src
-
-newman run application_tests.k8s.postman_collection.json \
-  --insecure \
-  --reporters cli,htmlextra \
-  --reporter-htmlextra-export newman-report.html \
-  --reporter-htmlextra-title "DO11 K8s Application Tests"
-newman
-
-Application Tests
-
-→ Login User
-  GET https://session.10.174.8.95.nip.io:443/api/v1/auth/authorize [200 OK, 952B, 809ms]
-  ✓  Login as a regular user
-
-→ Get Hotles
-  GET https://gateway.10.174.8.95.nip.io:443/api/v1/gateway/hotels [200 OK, 944B, 716ms]
-  ✓  Get hotels info
-
-→ Get Hotel
-  GET https://gateway.10.174.8.95.nip.io:443/api/v1/gateway/hotels/9d05ba36-bf8d-11eb-8529-0242ac130003 [200 OK, 630B, 96ms]
-  ✓  Get hotels info
-
-→ Book Hotel
-  POST https://gateway.10.174.8.95.nip.io:443/api/v1/gateway/booking [201 Created, 439B, 6.5s]
-  ✓  Book hotel
-
-→ Get User's Loyalty Balance
-  GET https://gateway.10.174.8.95.nip.io:443/api/v1/gateway/loyalty [200 OK, 509B, 105ms]
-  ✓  Get user's loyalty balance
-
-┌─────────────────────────┬────────────────────┬───────────────────┐
-│                         │           executed │            failed │
-├─────────────────────────┼────────────────────┼───────────────────┤
-│              iterations │                  1 │                 0 │
-├─────────────────────────┼────────────────────┼───────────────────┤
-│                requests │                  5 │                 0 │
-├─────────────────────────┼────────────────────┼───────────────────┤
-│            test-scripts │                 10 │                 0 │
-├─────────────────────────┼────────────────────┼───────────────────┤
-│      prerequest-scripts │                  5 │                 0 │
-├─────────────────────────┼────────────────────┼───────────────────┤
-│              assertions │                  5 │                 0 │
-├─────────────────────────┴────────────────────┴───────────────────┤
-│ total run duration: 8.4s                                         │
-├──────────────────────────────────────────────────────────────────┤
-│ total data received: 658B (approx)                               │
-├──────────────────────────────────────────────────────────────────┤
-│ average response time: 1660ms [min: 96ms, max: 6.5s, s.d.: 2.4s] │
-└──────────────────────────────────────────────────────────────────┘
-s@Vivo:~/DO-11/src$ 
-```
-
 
 
 
 ![alt text](<img/2/image copy 20.png>)
 
-newman-reporter-htmlextra — это дополнительный плагин для красивых HTML-отчётов. Они выглядят гораздо лучше, чем стандартный вывод Newman, и отлично смотрятся в отчёте
+[text](newman-report.html)
+
+
+Newman-reporter-htmlextra — это дополнительный плагин для красивых HTML-отчётов. Они выглядят гораздо лучше, чем стандартный вывод Newman, и отлично смотрятся в отчёте
 
 
 <br>
@@ -1104,11 +1045,16 @@ newman-reporter-htmlextra — это дополнительный плагин �
 
 
 
-    4. Оператор Prometheus
+##    4. Оператор Prometheus
 
-1) Отчет содержит описание запуска оператора Prometheus и скриншоты результатов.
+## 1) Отчет содержит описание запуска оператора Prometheus и скриншоты результатов.
 
-    0 1 2 3 4 5
+
+
+
+
+## 10. Установить и запустить Prometheus Operator для сбора метрик в системе. Продемонстрировать в отчете результат выполнения команды `kubectl get pods -n monitoring`.
+
 
 
 
@@ -1142,32 +1088,3 @@ newman-reporter-htmlextra — это дополнительный плагин �
 
 
 
-
-
-
-
-
-
-## Part 1. Развертывание собственного кластера k3s
-
-### Задание
-
-1. Получить набор виртуальных машин для кластера.
-
-2. Установить k3s на всех трех машинах. При установке не использовать стандартный Ingress Controller при помощи флага `--disable=traefik`.
-
-3. Выполнить подключение узлов к кластеру, используя команду `k3s server` и флаги `--token` и `--server` для рабочих узлов и мастера соответственно. Когда k3s установлен, можно использовать переменную окружения `NODE_TOKEN`.
-
-4. Установить Ingress Controller Nginx вместо стандартного. Ты можешь использовать официальный файл манифеста Ingress контроллера на базе Nginx, доступный на GitHub.
-
-5. Получить доменное имя и сконфигурировать внутри кластера утилиту `cert-manager`, которая должна генерировать wildcard-сертификат для полученного домена.
-
-6. Создать ресурс Ingress для своего личного домена и настроить его для использования контроллера nginx ingress и полученного сертификата.
-
-7. Создать PV (Persistent Volume) для базы данных PostgreSQL в манифесте из десятого проекта.
-
-8. Запустить приложение, описанное в манифесте.
-
-9. Запустить функциональные тесты Postman и удостовериться в работоспособности приложения.
-
-10. Установить и запустить Prometheus Operator для сбора метрик в системе. Продемонстрировать в отчете результат выполнения команды `kubectl get pods -n monitoring`.
