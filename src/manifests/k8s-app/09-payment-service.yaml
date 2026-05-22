@@ -40,3 +40,391 @@ spec:
     - port: 8084
       targetPort: 8084
   type: ClusterIP
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор Deployment + Service для payment-service
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment payment-service
+# Микросервис обработки платежей.
+# Простой stateless-сервис: создаёт запись о платеже, хранит
+# историю транзакций в своей БД (payments_db).
+# В реальном продакшне сюда же бы интегрировались внешние
+# платёжные шлюзы (Stripe, Сбер, ЮKassa) — но в учебном
+# проекте это симуляция: "платёж всегда успешен".
+# ============================================================
+apiVersion: apps/v1                  # API-группа apps, версия v1.
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: payment-service              # Имя Deployment'а.
+  labels: { app: payment-service }   # Метка на Deployment (inline YAML).
+spec:
+  replicas: 1                        # Одна реплика для лабы.
+                                     # ⚠️ В продакшне для payment-service:
+                                     # - 2+ реплики (финансовый сервис критичен),
+                                     # - идемпотентность по transaction_id (защита от
+                                     #   двойного списания при retry),
+                                     # - бекапы БД чаще, чем у других (каждый час).
+  selector:
+    matchLabels: { app: payment-service }
+                                     # Селектор: какие поды Deployment контролирует.
+  template:                          # Шаблон создаваемых подов.
+    metadata:
+      labels: { app: payment-service }
+                                     # Метка пода — совпадает с селектором.
+    spec:
+      containers:
+        - name: payment-service      # Имя контейнера в поде.
+          image: src-payment-service:latest
+                                     # Локальный образ Spring Boot приложения из DO10.
+          imagePullPolicy: Never     # Только локальный образ из containerd k3s.
+                                     # Должен быть импортирован заранее:
+                                     #   k3s ctr images import payment-service.tar
+          ports:
+            - containerPort: 8084    # Порт Spring Boot.
+                                     # Согласован с ConfigMap (PAYMENT_SERVICE_PORT: "8084").
+                                     # Booking-service ходит сюда по адресу
+                                     # http://payment-service:8084
+          env:                       # Минимальный набор переменных!
+                                     # payment-service — самый "одинокий" сервис в системе:
+                                     # к нему обращаются (booking), но он сам ни с кем не
+                                     # связан, кроме своей БД. Не публикует события в
+                                     # RabbitMQ, не вызывает другие сервисы.
+
+            # ─────────────────────────────────────────────
+            # Подключение к PostgreSQL (единственная зависимость)
+            # ─────────────────────────────────────────────
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: POSTGRES_HOST # → "postgres" (имя Service'а БД)
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: POSTGRES_PORT }
+                                     # → "5432"
+            - name: POSTGRES_DB
+              value: payments_db     # ⚠️ Plain value — у каждого сервиса своя БД.
+                                     # payments_db — отдельная БД для финансовых операций.
+                                     # Это правильная изоляция: данные о платежах не должны
+                                     # смешиваться с бронями/отелями.
+                                     # БД создаётся init-скриптом в образе src-postgres.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_USER }
+                                     # Логин postgres из Secret.
+                                     # ⚠️ В продакшне для финансового сервиса нужно:
+                                     # отдельный юзер payment_user, только с правами на
+                                     # payments_db, никакого superuser.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD }
+                                     # Пароль из Secret.
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для payment-service
+# Внутренний сервис, изолирован от внешнего мира.
+# К нему обращается ТОЛЬКО booking-service.
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Балансировщик + DNS-имя.
+metadata:
+  name: payment-service              # КЛЮЧЕВОЕ! По имени резолвится через CoreDNS.
+                                     # В ConfigMap: PAYMENT_SERVICE_HOST: payment-service
+                                     # booking-service делает:
+                                     #   POST http://payment-service:8084/api/v1/payments
+                                     #   { amount, paymentInfo, bookingUid }
+  labels: { app: payment-service }   # Метка на Service'е.
+spec:
+  selector: { app: payment-service } # Трафик в поды с этим лейблом.
+  ports:
+    - port: 8084                     # Входящий порт Service'а.
+      targetPort: 8084               # Порт пода (= containerPort).
+  type: ClusterIP                    # Только из кластера.
+                                     # ⚠️ Внешний доступ КАТЕГОРИЧЕСКИ запрещён!
+                                     # Платёжный сервис — это уязвимое место:
+                                     # - Хранит данные банковских карт (в реальном проекте).
+                                     # - Обрабатывает деньги.
+                                     # - PCI DSS требует строжайшей изоляции.
+                                     # ClusterIP + отсутствие Ingress = ни байта снаружи.
+```
+
+---
+
+## 🔗 Где payment-service в общей картине
+
+Этот сервис — **самый изолированный** в системе:
+
+```
+   [ Внешний мир / Postman ]
+              │
+              ▼
+   [ Ingress ] ─── НЕТ доступа к payment-service!
+              │
+              ▼
+   [ gateway-service ] ─── ТАКЖЕ НЕ ходит напрямую в payment!
+              │
+              ▼
+   [ booking-service ] ─── только этот сервис вызывает payment
+              │
+              │ POST http://payment-service:8084/api/v1/payments
+              │ Body: { amount: 2000, info: "card_4242...", bookingUid }
+              ▼
+   ┌───────────────────────────────────────┐
+   │ payment-service                       │
+   │  - валидирует данные карты            │
+   │  - симулирует обращение в банк        │
+   │  - сохраняет транзакцию               │
+   │  - возвращает paymentUid + статус     │
+   └────────────────┬──────────────────────┘
+                    │
+                    │ JDBC
+                    ▼
+   [ PostgreSQL: payments_db ]
+              │
+              ▼
+   ┌─────────────────────────────────────┐
+   │ Таблица transactions:                │
+   │ - id                                 │
+   │ - bookingUid                         │
+   │ - amount                             │
+   │ - currency                           │
+   │ - status (PAID/FAILED/REFUNDED)      │
+   │ - paymentInfo (масированно)          │
+   │ - createdAt                          │
+   └─────────────────────────────────────┘
+```
+
+**Особенности payment-service:**
+
+| Свойство | Значение | Почему |
+|----------|----------|--------|
+| Входящие вызовы | Только от booking-service | Никто другой не должен инициировать платежи |
+| Исходящие вызовы | Нет! Только в БД | Никаких HTTP-вызовов соседям, никакого RabbitMQ |
+| Внешний доступ | Категорически нет | PCI DSS, безопасность |
+| Состояние | Stateless (всё в БД) | Легко масштабируется |
+| Размер env-секции | Минимальный (5 переменных) | Нет интеграций с соседями |
+
+---
+
+## 🆚 Сравнение payment-service с booking-service
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    КОЛИЧЕСТВО ENV                            │
+├──────────────────────────────┬──────────────────────────────┤
+│ booking-service: 18 env      │ payment-service: 5 env       │
+│ - PostgreSQL (5)             │ - PostgreSQL (5)             │
+│ - RabbitMQ (6)               │                              │
+│ - HOTEL host/port (2)        │                              │
+│ - PAYMENT host/port (2)      │                              │
+│ - LOYALTY host/port (2)      │                              │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
+**Почему такая разница?**
+
+- **booking-service** — это **оркестратор**: дирижирует процессом бронирования, опрашивая 3-4 сервиса и публикуя события.
+- **payment-service** — это **листовой сервис**: принимает запрос, делает свою работу, отвечает. Никого не дёргает.
+
+Это типичная **звёздная топология** микросервисов: один сервис в центре связан со многими, а periphery-сервисы изолированы.
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> payment-service — изолированный микросервис обработки платежей. Deployment с одной репликой на порту 8084. Минимальный набор env: только подключение к собственной БД payments_db через ConfigMap (host/port) и Secret (логин/пароль). Не связан ни с RabbitMQ, ни с другими сервисами — к нему обращается только booking-service. Service ClusterIP полностью изолирует его от внешнего мира.
+
+*(длина ~400 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Почему у payment-service так мало env-переменных по сравнению с booking-service?**
+> Потому что payment-service — **листовой сервис** в графе зависимостей. У него только одна интеграция: PostgreSQL. Никаких вызовов в hotel, loyalty, никакой публикации в RabbitMQ.
+> 
+> Архитектурно это правильно: финансовый сервис должен быть максимально изолированным:
+> - Меньше зависимостей = меньше точек отказа.
+> - Меньше интеграций = меньше attack surface.
+> - Проще аудит безопасности.
+> 
+> Booking же — оркестратор: ему нужно "знать" всех соседей.
+
+**В2: Что произойдёт, если payment-service упадёт?**
+> Каскадный эффект на booking-service:
+> 1. Клиент шлёт `POST /booking` → gateway → booking-service.
+> 2. booking-service делает `POST http://payment-service:8084/...`.
+> 3. Сервис недоступен → ConnectException через ~3-10 секунд (зависит от timeout).
+> 4. booking-service возвращает 500/502 клиенту.
+> 5. Postman-тест "Book Hotel" провалится.
+> 
+> Защита (как и у других downstream-сервисов):
+> - Circuit breaker в booking-service.
+> - Retry с короткими таймаутами.
+> - Saga pattern: бронь в pending до подтверждения payment.
+
+**В3: Почему payment-service хранит данные в отдельной БД payments_db?**
+> Три причины:
+> 
+> 1. **Принцип Database per Service**: каждый микросервис владеет своей БД, не лезет в чужие.
+> 
+> 2. **Безопасность**: финансовые данные изолированы. Даже при компрометации hotel-service или booking-service — никто не сможет напрямую читать payments_db через JDBC (там другой connection string).
+> 
+> 3. **Compliance**: при работе с реальными платежами PCI DSS требует отдельной БД с особыми мерами (шифрование на диске, аудит-лог, ограниченный доступ). Отдельная БД с самого начала закладывает эту возможность.
+
+**В4: Должен ли payment-service использовать другого PostgreSQL-пользователя?**
+> Да, **в идеале**:
+> ```yaml
+> env:
+>   - name: POSTGRES_USER
+>     valueFrom:
+>       secretKeyRef:
+>         name: payment-secrets   # ← отдельный Secret для payment
+>         key: PAYMENT_DB_USER    # ← user "payment_user"
+> ```
+> С правами в БД:
+> ```sql
+> GRANT ALL ON payments_db.* TO payment_user;
+> -- НИКАКИХ прав на users_db, hotels_db и т.д.!
+> ```
+> 
+> У нас все сервисы под superuser `postgres` — это упрощение для лабы. В продакшне это критическая дыра: компрометированный payment-service даст полный доступ ко всем БД.
+
+**В5: Почему payment-service не публикует событие "платёж проведён" в RabbitMQ?**
+> Это дизайн-выбор моего проекта DO10. Альтернативные подходы:
+> 
+> 1. **Текущий**: booking-service сам публикует событие после получения ответа от payment.
+>    - Плюс: одна точка генерации событий.
+>    - Минус: если payment ответил, а booking упал — событие не отправится (dual-write проблема).
+> 
+> 2. **payment-service публикует сам**:
+>    - Плюс: гарантия событие = успешный платёж.
+>    - Минус: больше intent payment-service'а в работу с RabbitMQ.
+> 
+> 3. **Transactional Outbox**: payment пишет в outbox-таблицу в одной транзакции с самим платежом, отдельный процесс публикует.
+>    - Самое надёжное, но сложнее реализовать.
+
+**В6: Что произойдёт при двух одновременных платежах за одну бронь (race condition)?**
+> Зависит от реализации payment-service. Если просто:
+> ```java
+> @Transactional
+> public Payment create(PaymentRequest req) {
+>   Payment p = new Payment(req);
+>   paymentRepository.save(p);
+>   return p;
+> }
+> ```
+> Тогда оба запроса пройдут → **двойное списание!**
+> 
+> Защита через **идемпотентность**:
+> ```java
+> @Transactional
+> public Payment create(PaymentRequest req) {
+>   // Проверка по уникальному ключу
+>   return paymentRepository.findByBookingUid(req.bookingUid)
+>           .orElseGet(() -> paymentRepository.save(new Payment(req)));
+> }
+> ```
+> Плюс `UNIQUE(booking_uid)` constraint в БД.
+> 
+> Или **idempotency-key** в заголовке HTTP-запроса.
+
+**В7: Можно ли разнести payment-service на несколько реплик?**
+> Да, без проблем — он stateless:
+> - Все данные в БД.
+> - В памяти ничего не держит (или должен не держать).
+> - Каждая реплика обрабатывает запросы независимо.
+> 
+> Подводные камни:
+> - **Connection pool**: 2 реплики × 10 коннектов = 20 коннектов в PostgreSQL.
+> - **Идемпотентность**: критична! Если retry попадает в другой под — он не должен дублировать платёж. Решается через UNIQUE constraint в БД.
+
+**В8: Что произойдёт при `kubectl delete deploy/payment-service`?**
+> 1. Deployment удаляется.
+> 2. ReplicaSet (управляемый Deployment'ом) тоже удаляется.
+> 3. Поды удаляются с graceful shutdown (SIGTERM → 30 сек → SIGKILL).
+> 4. **Service остаётся!** (Это отдельный ресурс, его не удалит автоматически.)
+> 5. Service имеет селектор `app: payment-service`, но подов с такой меткой нет → endpoints пустые → подключения отваливаются с "connection refused".
+> 6. **PVC, Secret, ConfigMap, payments_db** — целы, при пересоздании Deployment'а сервис заработает снова.
+
+**В9: Чем отличается архитектура "payment как отдельный сервис" от "payment как библиотека внутри booking"?**
+> 
+> **Микросервис** (наш случай):
+> - **+** Независимая разработка и деплой.
+> - **+** Независимое масштабирование.
+> - **+** Изоляция отказа.
+> - **+** Языковая независимость (Java для booking, можно Python для payment).
+> - **−** Сетевые вызовы — latency, нужны retry/circuit breaker.
+> - **−** Распределённые транзакции (Saga).
+> 
+> **Монолит / общая библиотека**:
+> - **+** Простой код — обычный вызов метода.
+> - **+** Одна транзакция БД — гарантия консистентности.
+> - **+** Меньше операционных расходов.
+> - **−** Любое изменение payment требует деплоя всего сервиса.
+> - **−** Масштабируется всё целиком.
+> 
+> Микросервисы оправданы, когда либо команды большие, либо нагрузка асимметрична, либо нужна полная изоляция данных.
+
+**В10: Какие resource limits подходят для payment-service?**
+> Для лёгкого stateless Spring Boot сервиса:
+> ```yaml
+> resources:
+>   requests:
+>     cpu: "100m"
+>     memory: "256Mi"
+>   limits:
+>     cpu: "300m"
+>     memory: "512Mi"
+> ```
+> Spring Boot стартует ~200-400 МБ памяти даже на пустом проекте. CPU нагрузка минимальная — простой CRUD.
+
+**В11: Безопасно ли передавать `paymentInfo` (типа "card_4242...") через env-переменные booking-service?**
+> Нет! `paymentInfo` — это **тело запроса**, а не env-переменная booking-service. Оно приходит от клиента в HTTP-body:
+> ```json
+> { "paymentInfo": "card_4242..." }
+> ```
+> и передаётся в payment-service в HTTP-body.
+> 
+> **Проблема**: между сервисами трафик идёт **внутри кластера по HTTP** (не HTTPS!). Кто-то с доступом к кластеру может перехватить.
+> 
+> Защита в продакшне:
+> 1. **mTLS** между сервисами (Service Mesh: Istio, Linkerd).
+> 2. **Шифрование чувствительных полей** на уровне приложения (encrypt-on-send).
+> 3. **Tokenization**: payment-service хранит токен карты, а не саму карту.
+> 4. **NetworkPolicy** — изоляция: payment-service принимает трафик только от booking.
+
+**В12: Почему вообще нужен отдельный payment-service, а не просто `JOIN bookings ... payments`?**
+> Это вопрос границ ответственности (**bounded context** из DDD):
+> - **Booking domain**: брони, отели, номера, даты.
+> - **Payment domain**: транзакции, refund'ы, банковские интеграции, fraud detection, compliance.
+> 
+> Это **разные миры**:
+> - Разная экспертиза команд (платёжные системы — отдельная специальность).
+> - Разные циклы релизов (платёжная логика меняется реже, но критичнее).
+> - Разные регуляции (PCI DSS только для payment).
+> - Разные требования к доступности (payment может быть в режиме maintenance — booking покажет "оплата временно недоступна").
+> 
+> Соединять их в один сервис = смешивать ответственности и удваивать сложность.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀
+
+

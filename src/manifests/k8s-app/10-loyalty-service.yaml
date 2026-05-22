@@ -40,3 +40,410 @@ spec:
     - port: 8085
       targetPort: 8085
   type: ClusterIP
+
+
+
+
+
+# 📝 Построчный разбор Deployment + Service для loyalty-service
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment loyalty-service
+# Микросервис программы лояльности.
+# Хранит баланс бонусных баллов пользователей.
+# Структурно — близнец payment-service: тоже изолированный
+# листовой сервис с одной БД и без интеграций с соседями.
+#
+# Поток использования:
+#   - GET /loyalty       → читает баланс из balances_db
+#   - POST /loyalty      → начисляет/списывает баллы
+# В Postman: тест "Get User's Loyalty Balance" проходит
+# через gateway → loyalty-service.
+# ============================================================
+apiVersion: apps/v1                  # API-группа apps, версия v1.
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: loyalty-service              # Имя Deployment'а.
+  labels: { app: loyalty-service }   # Метка на Deployment (inline YAML).
+spec:
+  replicas: 1                        # Одна реплика для лабы.
+                                     # ⚠️ В продакшне для loyalty-service:
+                                     # - 2+ реплики (часто запрашивается клиентами),
+                                     # - read-heavy (баланс читают чаще, чем меняют),
+                                     # - идемпотентность операций начисления.
+  selector:
+    matchLabels: { app: loyalty-service }
+                                     # Селектор подов.
+  template:                          # Шаблон создаваемых подов.
+    metadata:
+      labels: { app: loyalty-service }
+                                     # Метка пода — совпадает с селектором.
+    spec:
+      containers:
+        - name: loyalty-service      # Имя контейнера в поде.
+          image: src-loyalty-service:latest
+                                     # Локальный образ Spring Boot из DO10.
+          imagePullPolicy: Never     # Только локальный образ из containerd k3s.
+                                     # Образ заранее импортирован:
+                                     #   k3s ctr images import loyalty-service.tar
+          ports:
+            - containerPort: 8085    # Порт Spring Boot.
+                                     # Согласован с ConfigMap (LOYALTY_SERVICE_PORT: "8085").
+                                     # booking-service ходит сюда:
+                                     #   http://loyalty-service:8085/api/v1/loyalty
+          env:                       # Минимальный набор переменных (как у payment-service).
+
+            # ─────────────────────────────────────────────
+            # Подключение к PostgreSQL — единственная зависимость
+            # ─────────────────────────────────────────────
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: POSTGRES_HOST # → "postgres"
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: POSTGRES_PORT }
+                                     # → "5432"
+            - name: POSTGRES_DB
+              value: balances_db     # ⚠️ Своя БД для балансов лояльности!
+                                     # Название может смутить: "balances_db" вместо
+                                     # ожидаемого "loyalty_db". Это историческое название
+                                     # из проекта DO10. Главное — оно совпадает с init-
+                                     # скриптом образа src-postgres.
+                                     # Внутри БД таблицы вроде:
+                                     #   user_balances (user_id, points, status)
+                                     #   loyalty_history (id, user_id, delta, reason)
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_USER }
+                                     # Логин из Secret (postgres superuser для лабы).
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD }
+                                     # Пароль из Secret.
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для loyalty-service
+# Внутренний сервис. Доступен только через gateway/booking.
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Балансировщик + DNS-имя.
+metadata:
+  name: loyalty-service              # КЛЮЧЕВОЕ! По имени резолвится через CoreDNS.
+                                     # В ConfigMap: LOYALTY_SERVICE_HOST: loyalty-service
+                                     # Два потребителя:
+                                     # 1. booking-service — после успешной брони
+                                     #    POST http://loyalty-service:8085/api/v1/loyalty
+                                     #    { userId, points: +200 }
+                                     # 2. gateway-service — для запроса баланса
+                                     #    GET http://loyalty-service:8085/api/v1/loyalty
+                                     #    Headers: X-User-Id: ...
+  labels: { app: loyalty-service }   # Метка на Service.
+spec:
+  selector: { app: loyalty-service } # Трафик идёт в поды с этим лейблом.
+  ports:
+    - port: 8085                     # Порт Service'а — входящий.
+      targetPort: 8085               # Порт пода — куда форвардить.
+  type: ClusterIP                    # Доступен только из кластера.
+                                     # Снаружи к нему НЕТ прямого пути — только через gateway.
+```
+
+---
+
+## 🔗 Как loyalty-service вписывается в систему
+
+```
+   [ Postman: Get User's Loyalty Balance ]
+              │
+              │ GET https://gateway.10.174.8.95.nip.io/api/v1/gateway/loyalty
+              │ Authorization: Bearer eyJhbGc...
+              ▼
+   [ Ingress → gateway-service:8087 ]
+              │ 1. Валидирует JWT
+              │ 2. Извлекает userId из токена
+              │ 3. Маршрутизирует на loyalty
+              ▼
+   [ GET http://loyalty-service:8085/api/v1/loyalty ]
+              │ Header: X-User-Id: 123
+              ▼
+   ┌────────────────────────────────────────┐
+   │ Pod loyalty-service                     │
+   │                                         │
+   │ SELECT * FROM user_balances             │
+   │   WHERE user_id = 123                   │
+   │                                         │
+   │ Возвращает: { points: 500, status: ... } │
+   └────────────────┬───────────────────────┘
+                    │
+                    ▼
+   [ JDBC: jdbc:postgresql://postgres:5432/balances_db ]
+                    │
+                    ▼
+   [ Service postgres → Pod postgres → /var/lib/postgres-pv ]
+                    │
+                    ▼
+   [ Возврат: { userId: 123, points: 500 } ]
+
+
+Параллельный поток — начисление баллов при бронировании:
+
+   [ booking-service после успешной брони ]
+              │
+              │ POST http://loyalty-service:8085/api/v1/loyalty
+              │ { userId: 123, delta: +200, reason: "booking_completed" }
+              ▼
+   [ loyalty-service ]
+              │
+              │ INSERT INTO loyalty_history (user_id, delta, reason) ...
+              │ UPDATE user_balances SET points = points + 200
+              │     WHERE user_id = 123
+              ▼
+   [ Возврат: { newBalance: 700 } ]
+```
+
+---
+
+## 🆚 Сравнение всех "листовых" сервисов
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│       hotel-service    payment-service    loyalty-service        │
+├─────────────────────────────────────────────────────────────────┤
+│ Порт:        8082             8084               8085            │
+│ БД:          hotels_db        payments_db        balances_db     │
+│ Env:         5 переменных     5 переменных       5 переменных    │
+│ RabbitMQ:    нет              нет                нет             │
+│ Внешние:     нет              нет                нет             │
+│ HTTP клиенты:                                                    │
+│   booking ──►   ✅               ✅                  ✅            │
+│   gateway ──►   ✅               ❌                  ✅            │
+│              (для /hotels)    (только через      (для /loyalty)  │
+│                                 booking)                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Закономерность:** все три сервиса — структурные близнецы. Меняются только три параметра:
+1. Имя ресурсов (hotel/payment/loyalty).
+2. Порт (8082/8084/8085).
+3. БД (hotels_db/payments_db/balances_db).
+
+Это **типовой шаблон** для CRUD-микросервиса в k8s. Если в проекте появится новый сервис (например, `notification-service`) — он, скорее всего, будет описан таким же шаблоном.
+
+---
+
+## 🧮 Архитектурный паттерн: "Звезда вокруг booking-service"
+
+```
+                  ┌─────────────────┐
+                  │ gateway-service  │
+                  │     :8087        │
+                  └────────┬─────────┘
+                           │
+            ┌──────────────┼──────────────┐
+            ▼              ▼              ▼
+       [ hotel ]    [ booking ]    [ loyalty ]
+       :8082        :8083 ★        :8085
+                       │
+            ┌──────────┴──────────┬─────────────┐
+            ▼                     ▼             ▼
+       [ hotel ]            [ payment ]    [ loyalty ]
+                            :8084
+                       
+                       │
+                       ▼ event
+                  [ RabbitMQ ]
+                       │
+                       ▼
+                  [ report ]
+                  :8086
+
+★ — booking-service ходит в hotel/payment/loyalty + RabbitMQ
+```
+
+**Кто куда ходит:**
+
+| Сервис | Кого вызывает |
+|--------|---------------|
+| gateway | session (валидация JWT), hotel, booking, loyalty |
+| session | ничего (только БД) |
+| hotel | ничего (только БД) |
+| booking | hotel, payment, loyalty + RabbitMQ |
+| payment | ничего (только БД) |
+| loyalty | ничего (только БД) |
+| report | ничего (только подписка на RabbitMQ + БД) |
+
+**Booking-service — единственный оркестратор**. Все остальные — либо листовые (payment/loyalty/hotel), либо точки входа (gateway/session), либо обработчики событий (report).
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> loyalty-service хранит баланс бонусных баллов пользователей. Deployment с одной репликой на порту 8085. Структурно — близнец payment-service: только подключение к собственной БД balances_db через ConfigMap (host/port) и Secret (логин/пароль). Без RabbitMQ и без вызовов соседей. К нему обращаются booking-service (начисление баллов) и gateway-service (запрос баланса). Service ClusterIP, наружу скрыт.
+
+*(длина ~420 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Почему БД называется `balances_db`, а не `loyalty_db`? Это ошибка?**
+> Это историческое название из исходного проекта DO10. Главное условие — оно совпадает с init-скриптом образа `src-postgres`. Если в скрипте написано `CREATE DATABASE balances_db;`, то и в env должно быть `balances_db`, иначе сервис не найдёт БД и упадёт с `FATAL: database "loyalty_db" does not exist`.
+> 
+> В реальном проекте я бы переименовал в `loyalty_db` для консистентности — это технический долг.
+
+**В2: Почему loyalty-service выглядит почти идентично payment-service?**
+> Потому что оба — **листовые stateless CRUD-сервисы** одного типа:
+> - У каждого своя БД.
+> - Никаких интеграций с соседями.
+> - Принимают HTTP-запросы, читают/пишут в БД, отдают ответ.
+> 
+> Это правильно: одинаковая структура = одинаковый шаблон. Если завтра добавится `notification-service` — он будет выглядеть так же: 5 env-переменных, своя БД, ClusterIP Service. Это **паттерн микросервиса** в k8s.
+
+**В3: Что произойдёт, если loyalty-service упадёт во время `POST /booking`?**
+> Зависит от логики booking-service. Возможные сценарии:
+> 
+> **Без обработки**: booking упадёт, бронь не создастся, клиент получит 500.
+> 
+> **Compensating action**: бронь и оплата уже выполнены, начисление баллов провалилось → нужно либо:
+> 1. Откатить бронь и оплату (Saga compensating).
+> 2. Допустить, что баллы не начислились (eventual consistency).
+> 3. Отправить в RabbitMQ для повторной попытки позже (queue + retry).
+> 
+> **Правильный подход**: баллы лояльности — не критичны для оформления брони. Их можно начислить позже:
+> ```
+> 1. Создать бронь (sync).
+> 2. Провести оплату (sync).
+> 3. Опубликовать "booking_completed" в RabbitMQ (sync, быстро).
+> 4. loyalty-service подписывается и начисляет → если упал, RabbitMQ хранит сообщение.
+> ```
+
+**В4: Почему запросы к loyalty идут через gateway, а не напрямую от Postman?**
+> Принцип единой точки входа (**API Gateway pattern**):
+> 1. **Безопасность**: только gateway имеет ingress. loyalty-service вообще не виден снаружи.
+> 2. **Аутентификация**: gateway валидирует JWT и извлекает `userId`. loyalty-service доверяет ему.
+> 3. **Cross-cutting concerns**: rate limiting, логирование, мониторинг — всё в одном месте.
+> 4. **Стабильный контракт для клиента**: даже если внутри изменится разделение на сервисы — клиент не пострадает.
+> 5. **CORS, версионирование API** — управляется на gateway.
+> 
+> Без gateway клиенту пришлось бы ходить в 5 разных хостов с разной логикой авторизации — кошмар.
+
+**В5: Как loyalty-service узнаёт, какому пользователю начислять баллы?**
+> `userId` приходит в **теле HTTP-запроса** или **заголовке**. Например:
+> ```http
+> POST /api/v1/loyalty HTTP/1.1
+> Host: loyalty-service:8085
+> X-User-Id: 123
+> Content-Type: application/json
+> 
+> { "delta": 200, "reason": "booking" }
+> ```
+> 
+> Или в JSON body:
+> ```json
+> { "userId": 123, "delta": 200 }
+> ```
+> 
+> **Кто извлекает userId?** gateway-service:
+> 1. Декодирует JWT.
+> 2. Достаёт userId из claims.
+> 3. Кладёт в заголовок и проксирует.
+> 
+> Сам loyalty-service **не валидирует JWT** — он доверяет, что gateway всё проверил. Это типичный подход в zero-trust сетях смягчается через mTLS, но в простой схеме — доверие на границе.
+
+**В6: Что произойдёт при двух параллельных вызовах "начислить баллы" с одного booking?**
+> Это **race condition** в loyalty-service. Сценарий:
+> 1. Запрос #1: `SELECT points FROM balances WHERE user_id=123` → 500.
+> 2. Запрос #2: `SELECT points FROM balances WHERE user_id=123` → 500.
+> 3. Запрос #1: `UPDATE balances SET points = 500 + 200 = 700`.
+> 4. Запрос #2: `UPDATE balances SET points = 500 + 200 = 700`.
+> 
+> Результат: 700 вместо ожидаемых 900. **Потеря обновления!**
+> 
+> Защита:
+> 1. **Atomic UPDATE**: `UPDATE balances SET points = points + 200 WHERE user_id = 123` — БД сама атомарно увеличивает.
+> 2. **Optimistic lock**: версионное поле, retry при конфликте.
+> 3. **Pessimistic lock**: `SELECT ... FOR UPDATE` блокирует строку.
+> 4. **Идемпотентность**: уникальный transaction_id, дубликаты игнорируются.
+
+**В7: Можно ли запускать loyalty-service в нескольких репликах?**
+> Да, без проблем — он stateless:
+> - Все данные в БД.
+> - Без сессий в памяти.
+> 
+> Подводные камни:
+> - **Connection pool**: 3 пода × 10 коннектов = 30 коннектов. PostgreSQL по умолчанию даёт 100 — упрётся быстро. Решение: PgBouncer (connection pooler).
+> - **Кеш**: если есть локальный кеш (Caffeine) — у каждого пода свой. При изменении баланса в одном поде другой может вернуть устаревшие данные. Решение: Redis или принять eventual consistency.
+
+**В8: Почему loyalty не публикует событие в RabbitMQ при изменении баланса?**
+> Это дизайн моего проекта. В реальном продакшне часто публикуют:
+> - `loyalty.points_credited` → уведомление пользователю по email/push.
+> - `loyalty.tier_upgraded` → переход в VIP-категорию.
+> - `loyalty.points_expired` → для аналитики.
+> 
+> В нашем учебном проекте такого нет, потому что:
+> 1. report-service подписан только на события от booking-service.
+> 2. Нет email/push сервиса.
+> 3. Упрощение архитектуры для лабы.
+
+**В9: Что хранится в `balances_db`? Какие таблицы?**
+> Предположительная схема (на основе кода Spring Boot):
+> ```sql
+> CREATE TABLE user_balances (
+>   user_id    BIGINT PRIMARY KEY,
+>   points     INT NOT NULL DEFAULT 0,
+>   status     VARCHAR(20) DEFAULT 'BRONZE',
+>   updated_at TIMESTAMP DEFAULT NOW()
+> );
+> 
+> CREATE TABLE loyalty_history (
+>   id         BIGSERIAL PRIMARY KEY,
+>   user_id    BIGINT REFERENCES user_balances(user_id),
+>   delta      INT NOT NULL,
+>   reason     VARCHAR(100),
+>   created_at TIMESTAMP DEFAULT NOW()
+> );
+> ```
+> 
+> Status может быть: BRONZE → SILVER → GOLD → PLATINUM в зависимости от points. Это типичная "tiered loyalty" схема.
+
+**В10: Можно ли использовать одну БД для loyalty и для других сервисов?**
+> **Технически** — да. Все сервисы коннектятся к одному PostgreSQL контейнеру. Если у всех POSTGRES_DB будет одинаковым — будут писать в одну БД.
+> 
+> **Архитектурно** — это **антипаттерн**: distributed monolith. Проблемы:
+> 1. Связанность: миграции одного сервиса могут сломать другой.
+> 2. Производительность: тяжёлый JOIN booking→loyalty блокирует обоих.
+> 3. Эволюция: нельзя поменять схему loyalty без согласования с booking.
+> 4. Безопасность: компрометация одного сервиса = доступ ко всем данным.
+> 
+> Database per Service — это **граница bounded context** в DDD. Нарушать её можно, только если очень нужно (например, для аналитических запросов через CDC + DWH).
+
+**В11: Что произойдёт при `kubectl scale deploy loyalty-service --replicas=0`?**
+> 1. Deployment установит desired replicas = 0.
+> 2. Все поды loyalty-service будут удалены graceful (SIGTERM → 30 сек → SIGKILL).
+> 3. Service остаётся, но endpoints пустые.
+> 4. Любой вызов на `loyalty-service:8085` → connection refused.
+> 5. booking-service будет получать ошибки при попытке начислить баллы.
+> 6. Postman-тест "Get User's Loyalty Balance" провалится.
+> 
+> Это удобный способ временно "выключить" сервис без удаления манифестов.
+
+**В12: Какой минимальный набор операций нужен loyalty-service для работы?**
+> CRUD-операции:
+> ```
+> GET    /api/v1/loyalty           → получить баланс текущего пользователя
+> GET    /api/v1/loyalty/{userId}  → получить баланс по ID (admin only)
+> POST   /api/v1/loyalty           → начислить/списать баллы
+> GET    /api/v1/loyalty/history   → история изменений
+> ```
+> 
+> Плюс возможны:
+> - `PUT /api/v1/loyalty/status` → ручное изменение статуса (admin).
+> - `DELETE /api/v1/loyalty/history/{id}` → удаление записи истории (компенсация ошибочной операции).
+
+Если по какой-то строке хочется глубже — спрашивай 🚀

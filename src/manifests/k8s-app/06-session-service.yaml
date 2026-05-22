@@ -40,3 +40,316 @@ spec:
     - port: 8081
       targetPort: 8081
   type: ClusterIP
+
+
+
+
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор Deployment + Service для session-service
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment session-service
+# Микросервис аутентификации и авторизации пользователей.
+# В Postman: первый запрос "Login User" идёт сюда (порт 8081).
+# Выдаёт Bearer-токен, который используется в последующих запросах
+# к gateway-service.
+# ============================================================
+apiVersion: apps/v1                  # API-группа apps, версия v1.
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: session-service              # Имя Deployment'а.
+                                     # Совпадает с именем Service ниже — стандартная практика.
+  labels: { app: session-service }   # Метка на Deployment (inline YAML).
+spec:
+  replicas: 1                        # Одна реплика для лабораторной.
+                                     # ⚠️ В продакшне stateless-сервисы запускают 2-3+ реплики
+                                     # для отказоустойчивости и rolling-update без downtime.
+                                     # session-service stateless (сессии в БД, не в памяти),
+                                     # значит масштабируется горизонтально без проблем.
+  selector:
+    matchLabels: { app: session-service }
+                                     # Селектор подов: какие поды считать своими.
+  template:                          # Шаблон пода.
+    metadata:
+      labels: { app: session-service }
+                                     # Метка пода — должна совпадать с селектором.
+    spec:
+      containers:
+        - name: session-service      # Имя контейнера в поде.
+          image: src-session-service:latest
+                                     # Локальный образ, собранный из проекта DO10.
+                                     # Spring Boot приложение, упакованное в Docker.
+                                     # latest — анти-паттерн, но для лабы ОК.
+          imagePullPolicy: Never     # Использовать ТОЛЬКО локальный образ.
+                                     # Образ должен быть импортирован в containerd:
+                                     #   k3s ctr images import session-service.tar
+                                     # Без этого: ErrImageNeverPull при первом запуске.
+          ports:
+            - containerPort: 8081    # Порт, на котором слушает Spring Boot приложение.
+                                     # Прописан в application.yml/properties:
+                                     #   server.port=8081
+                                     # ⚠️ Согласован с Postman: USERS_PORT=8081.
+          env:                       # Переменные окружения для конфигурации Spring Boot.
+                                     # Spring читает их через @Value или application.yml:
+                                     #   spring.datasource.url=jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+
+            # ----- Подключение к PostgreSQL -----
+            - name: POSTGRES_HOST    # Имя env-переменной для приложения.
+              valueFrom:             # Берём значение не из plain, а из ConfigMap.
+                configMapKeyRef:
+                  name: app-config   # Имя ConfigMap (тот, что мы разбирали ранее).
+                  key: POSTGRES_HOST # Конкретный ключ внутри ConfigMap → "postgres".
+                                     # CoreDNS резолвит "postgres" в ClusterIP Service postgres.
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: POSTGRES_PORT }
+                                     # → "5432" (строка).
+            - name: POSTGRES_DB      # Имя БД, к которой коннектится session-service.
+              value: users_db        # ⚠️ Plain value, НЕ из ConfigMap!
+                                     # Почему так: каждый сервис использует СВОЮ базу:
+                                     #   session-service → users_db
+                                     #   hotel-service   → hotels_db
+                                     #   booking-service → bookings_db
+                                     #   payment-service → payments_db
+                                     #   loyalty-service → loyalty_db
+                                     #   report-service  → report_db
+                                     # Имя БД специфично для каждого сервиса, поэтому
+                                     # хранится прямо в Deployment'е, а не в общем ConfigMap.
+                                     # БД users_db должна быть создана init-скриптом в образе
+                                     # src-postgres при первом запуске.
+
+            # ----- Учётные данные PostgreSQL -----
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_USER }
+                                     # Берём из Secret, не ConfigMap! Логин — чувствительные.
+                                     # Декодируется из base64 → "postgres".
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD }
+                                     # Пароль из Secret → "postgres".
+                                     # ⚠️ session-service подключается к БД под суперпользователем
+                                     # — это удобно для лабы, но в продакшне неправильно.
+                                     # Лучше: отдельный юзер с правами только на свою БД.
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для session-service
+# Открывает порт 8081 для других сервисов в кластере.
+# ClusterIP — изнутри. Снаружи к нему ходит Ingress (см. ingress.yaml).
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Балансировщик + DNS-имя.
+metadata:
+  name: session-service              # КЛЮЧЕВОЕ! По этому имени обращаются другие сервисы:
+                                     #   ConfigMap: SESSION_SERVICE_HOST: session-service
+                                     # CoreDNS: session-service → ClusterIP этого Service.
+                                     # gateway-service ходит сюда для валидации токенов.
+  labels: { app: session-service }   # Метка на Service.
+spec:
+  selector: { app: session-service } # Трафик идёт в поды с этим лейблом.
+                                     # У нас replicas: 1, поэтому балансировка не нужна.
+  ports:
+    - port: 8081                     # Порт Service'а.
+                                     # Под этим портом видят его другие поды:
+                                     #   http://session-service:8081
+      targetPort: 8081               # Порт пода (containerPort).
+                                     # Совпадает с containerPort из Deployment.
+                                     # Может отличаться (например, port: 80 → targetPort: 8081),
+                                     # но для единообразия лучше совпадение.
+  type: ClusterIP                    # Тип Service: ClusterIP (default).
+                                     # Доступен только из кластера.
+                                     # ⚠️ session-service нужен снаружи (для Postman логина)!
+                                     # Как же он доступен извне? — через Ingress.
+                                     # Ingress смотрит на host (session.10.174.8.95.nip.io)
+                                     # и проксирует HTTPS-трафик на этот Service.
+                                     # Сам Service наружу не светится, что правильно.
+```
+
+---
+
+## 🔗 Путь запроса от Postman до session-service
+
+```
+   [ Postman / curl ]
+            │
+            │ GET https://session.10.174.8.95.nip.io/api/v1/auth/authorize
+            │ Authorization: Basic VXNlcjpxd2VydHk=
+            ▼
+   [ DNS nip.io резолвит → 10.174.8.95 ]
+            │
+            ▼
+   [ master-нода k3s, порт 443 ]
+            │
+            ▼
+   [ Ingress-Nginx Controller ]
+            │ TLS termination (расшифровка HTTPS)
+            │ Смотрит Host: session.10.174.8.95.nip.io
+            │ Находит правило → backend: session-service:8081
+            ▼
+   [ Service session-service (ClusterIP) ]
+            │ kube-proxy iptables/IPVS
+            ▼
+   [ Pod session-service-xxx-yyy ]
+            │ Spring Boot слушает 0.0.0.0:8081
+            │
+            ▼
+   [ Spring Boot Controller /api/v1/auth/authorize ]
+            │ Декодирует Basic Auth → User:qwerty
+            │ Ищет в БД
+            ▼
+   [ JDBC: jdbc:postgresql://postgres:5432/users_db ]
+            │
+            ▼
+   [ Service postgres → Pod postgres → /var/lib/postgres-pv/pgdata ]
+            │
+            ▼
+   [ SELECT * FROM users WHERE username='User' AND password='qwerty' ]
+            │
+            ▼
+   [ Найден → генерирует JWT-токен ]
+            │
+            ▼
+   [ Response 200 OK ]
+   [ Authorization: Bearer eyJhbGc... ]
+            │
+            ▼
+   [ Возврат тем же путём до Postman ]
+   [ Postman сохраняет токен в переменной {{BEARER}} ]
+   [ Использует его в дальнейших запросах к gateway-service ]
+```
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> session-service — это микросервис аутентификации, точка входа №1 в Postman-тестах. Deployment одной репликой запускает локальный образ src-session-service на порту 8081. Адрес и порт PostgreSQL берутся из ConfigMap, креды — из Secret, имя БД (users_db) задано прямо в манифесте, так как уникально для каждого сервиса. Service ClusterIP делает его доступным внутри кластера, наружу — через Ingress.
+
+*(длина ~440 символов, могу сократить до 300 при необходимости)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Почему имя БД `users_db` указано plain value, а не в ConfigMap?**
+> Потому что у каждого микросервиса **своя** БД (users_db, hotels_db, bookings_db и т.д.). Если положить их в общий `app-config`, получится по ключу на каждый сервис — 6 ключей вместо одного. Удобнее задать прямо в Deployment, где это единичная константа. Альтернатива: завести отдельный ConfigMap на каждый сервис — это правильнее с точки зрения изоляции, но громоздко для лабы.
+
+**В2: Почему session-service подключается под суперпользователем `postgres`?**
+> Это упрощение для лабораторной. В продакшне нужно:
+> 1. Создать отдельного пользователя `session_user` с паролем.
+> 2. Дать ему права **только** на свою БД `users_db`.
+> 3. Хранить отдельные `SESSION_DB_USER` и `SESSION_DB_PASSWORD` в Secret'е.
+> 
+> Принцип **least privilege**: компрометация одного сервиса не даёт доступ к данным других.
+
+**В3: Что произойдёт при увеличении `replicas` до 3?**
+> Создастся 3 пода session-service. Service балансирует round-robin между ними. Это работает, потому что:
+> - **Stateless архитектура**: сервис не хранит сессии в памяти, всё в БД.
+> - **Общая БД**: все три пода видят одни и те же таблицы users / sessions.
+> - **JWT-токены**: не привязаны к конкретной ноде, могут валидироваться любым подом.
+> 
+> Если бы сессии хранились в локальной памяти (HttpSession без shared storage) — пришлось бы либо настраивать sticky sessions, либо переходить на распределённое хранилище (Redis).
+
+**В4: Зачем env-переменные, если можно положить всё в application.yml?**
+> Принцип **The Twelve-Factor App** (фактор III, "Config"): конфигурация должна быть **в окружении**, не в коде. Это даёт:
+> - **Один образ — разные окружения**. Dev/stage/prod крутят тот же `src-session-service:latest`, но с разными env.
+> - **Безопасность**: пароли не лежат в git вместе с кодом.
+> - **k8s-native подход**: ConfigMap + Secret → env → приложение. Стандартная цепочка.
+> 
+> Spring Boot отлично работает с env: `${POSTGRES_HOST}` в application.yml → подставляется из env.
+
+**В5: Что произойдёт, если ConfigMap `app-config` удалить, пока под живёт?**
+> Под продолжит работать! Env-переменные читаются **один раз** при старте, и больше не зависят от ConfigMap. Удаление ConfigMap не убьёт под.
+> 
+> Но:
+> - При перезапуске пода новый под не сможет стартовать (env не из чего брать) → CreateContainerConfigError.
+> - Если ConfigMap смонтирован как volume — содержимое файлов обновляется через ~60 секунд (а при удалении ConfigMap файлы исчезают).
+
+**В6: Почему `imagePullPolicy: Never` — это нормально для приватного локального образа?**
+> Потому что образ `src-session-service:latest`:
+> 1. Собран локально через `docker build`.
+> 2. НЕ запушен в Docker Hub / GitLab Registry.
+> 3. Импортирован в containerd k3s через `k3s ctr images import`.
+> 
+> Если бы оставили policy `Always` или `IfNotPresent` (default для latest = Always) — k3s бы пытался скачать с Docker Hub, получил бы 404, под застрял бы в `ErrImagePull`.
+
+**В7: Как session-service узнаёт о существовании БД `users_db`? Кто её создаёт?**
+> БД создаётся **при первом запуске PostgreSQL** через init-скрипт. В кастомном образе `src-postgres` есть файл вроде `/docker-entrypoint-initdb.d/init.sql`:
+> ```sql
+> CREATE DATABASE users_db;
+> CREATE DATABASE hotels_db;
+> CREATE DATABASE bookings_db;
+> -- и т.д.
+> ```
+> Этот скрипт выполняется ровно ОДИН раз — когда PGDATA пуст. При последующих запусках skip.
+> 
+> Если PVC удалить → пересоздать → init-скрипт сработает заново.
+
+**В8: Что если session-service стартует раньше, чем PostgreSQL готов?**
+> Spring Boot упадёт с ошибкой `Connection refused` или `Cannot create PoolableConnectionFactory`. Стандартные решения:
+> 
+> 1. **Init container** в поде session-service:
+> ```yaml
+> initContainers:
+>   - name: wait-for-postgres
+>     image: busybox
+>     command: ['sh', '-c', 'until nc -z postgres 5432; do sleep 2; done']
+> ```
+> Этот контейнер запускается ПЕРЕД основным и блокирует старт, пока postgres не отвечает.
+> 
+> 2. **Readiness probe** + Spring retry: приложение пробует подключиться к БД с экспоненциальной задержкой.
+> 
+> 3. **k8s сам перезапустит** под при крэше → второй раз PostgreSQL уже готов.
+
+**В9: Service `ClusterIP`, но Postman ходит снаружи — как это работает?**
+> Через **Ingress**! Цепочка такая:
+> 1. Postman → `https://session.10.174.8.95.nip.io` → IP master-ноды.
+> 2. На master-ноде слушает Ingress-Nginx (порт 443).
+> 3. Ingress видит Host: session.10.174.8.95.nip.io → ищет правило → backend: session-service:8081.
+> 4. Ingress форвардит запрос на ClusterIP сервиса session-service.
+> 5. Service балансирует на под.
+> 
+> Сам Service ClusterIP **не** выставлен наружу — между Postman и подом стоит Ingress как прокси.
+
+**В10: Что если приложение в контейнере слушает не на 8081, а на 9999?**
+> Тогда:
+> - `containerPort: 8081` — это лишь **документирующее** поле, k8s его не проверяет.
+> - `targetPort: 8081` в Service — это **реальный** порт, куда форвардится трафик.
+> - Если приложение слушает 9999, а targetPort 8081 → Service шлёт на 8081 → connection refused → 502 Bad Gateway.
+> 
+> targetPort должен точно совпадать с тем, на чём слушает приложение внутри контейнера.
+
+**В11: Почему секреты передаются через env, а не через volume?**
+> Env-вариант:
+> - **Плюсы**: проще, читать как любую env-переменную в Spring Boot.
+> - **Минусы**: видны в `kubectl describe pod`, могут протечь в логи/core dumps.
+> 
+> Volume mount:
+> - **Плюсы**: файлы в `/etc/secrets/`, не светятся в env, обновляются автоматически без рестарта.
+> - **Минусы**: нужно адаптировать приложение читать файлы, чуть сложнее.
+> 
+> Для лабораторной env проще. Для продакшна — лучше volume или внешний vault.
+
+**В12: Какой следующий шаг после Login User в Postman?**
+> Сценарий тестов:
+> 1. **Login** → session-service выдаёт `Authorization: Bearer eyJ...`.
+> 2. Postman сохраняет токен в переменной `{{BEARER}}`.
+> 3. **Get Hotels** → gateway-service с заголовком `Authorization: {{BEARER}}`.
+> 4. Gateway проверяет токен (валидирует подпись или спрашивает session-service).
+> 5. Если ОК → проксирует запрос в hotel-service → возврат списка отелей.
+> 
+> session-service участвует только в шаге 1, дальше всё через gateway. Но gateway может ходить в session за валидацией JWT — это уже архитектурный выбор.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀
+

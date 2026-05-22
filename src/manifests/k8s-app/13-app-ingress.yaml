@@ -33,3 +33,549 @@ spec:
                 name: gateway-service
                 port:
                   number: 8087
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор Ingress для двух хостов приложения
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# Ingress = правило маршрутизации HTTPS-трафика снаружи в кластер.
+# Этот манифест — "финальная сборка" всего проекта: связывает
+# внешний мир, TLS-сертификаты, ingress-nginx-контроллер и
+# два внутренних Service'а (session и gateway).
+#
+# Архитектурное решение: два хоста на одном wildcard-сертификате.
+#   session.10.174.8.95.nip.io  → session-service:8081
+#   gateway.10.174.8.95.nip.io  → gateway-service:8087
+# Это раскрывает смысл wildcard-сертификата *.10.174.8.95.nip.io
+# из задания (пункт 5: "сгенерировать wildcard-сертификат").
+# ============================================================
+apiVersion: networking.k8s.io/v1     # API-группа networking, версия v1 (стабильная с k8s 1.19+).
+                                     # Раньше Ingress жил в extensions/v1beta1 — устарело.
+kind: Ingress                        # Тип ресурса: правило входящего HTTP/HTTPS трафика.
+                                     # ВАЖНО: Ingress — это лишь "конфиг".
+                                     # Реальную работу делает ingress-controller (nginx-под).
+metadata:
+  name: app-ingress                  # Имя ресурса в k8s.
+                                     # kubectl get ingress app-ingress
+                                     # Под этим именем будет видно в ingress-nginx логах.
+  namespace: default                 # Namespace, где живёт Ingress.
+                                     # ⚠️ КРИТИЧНО: Ingress видит Service'ы ТОЛЬКО в своём
+                                     # namespace! Все наши сервисы (session, gateway,
+                                     # hotel, booking, ...) тоже в default — ОК.
+                                     # Если бы они были в другом ns — пришлось бы создавать
+                                     # либо два Ingress'а (по одному в каждом ns), либо
+                                     # ExternalName Service в default, ссылающийся на тот ns.
+  annotations:                       # Аннотации = "пометки" для контроллеров.
+                                     # Не влияют на сам k8s, но cert-manager и nginx их читают.
+    cert-manager.io/cluster-issuer: my-ca-issuer
+                                     # МАГИЯ cert-manager:
+                                     # "Увидел эту аннотацию → автоматически выпусти TLS-
+                                     # сертификат для хостов из секции tls через my-ca-issuer".
+                                     #
+                                     # Что произойдёт автоматически:
+                                     # 1. cert-manager создаст ресурс Certificate
+                                     #    с dnsNames = [session.*, gateway.*]
+                                     # 2. Сгенерирует приватный ключ.
+                                     # 3. Подпишет через my-ca-issuer (наш собственный CA).
+                                     # 4. Положит в Secret wildcard-nipio-tls.
+                                     # 5. Сам ingress-nginx подхватит Secret и применит.
+                                     #
+                                     # ⚠️ В нашем случае Secret УЖЕ создан явным
+                                     # Certificate-ресурсом (wildcard-cert.yaml).
+                                     # Эта аннотация — дублирующая защита: если бы
+                                     # Certificate был забыт, cert-manager создал бы его сам.
+spec:
+  ingressClassName: nginx            # КАКОЙ ingress-controller должен обработать.
+                                     # У нас установлен ingress-nginx, его IngressClass = "nginx".
+                                     # Альтернатива (устаревшая):
+                                     #   annotations:
+                                     #     kubernetes.io/ingress.class: nginx
+                                     # Преимущество ingressClassName: это полноценное поле
+                                     # spec, можно валидировать на API-уровне.
+  tls:                               # Секция TLS = "какие хосты обслуживать по HTTPS".
+                                     # Если бы убрать всю секцию tls — Ingress работал бы
+                                     # только по HTTP (80 порт), без сертификатов.
+    - hosts:                         # Список доменов, для которых нужен сертификат.
+        - session.10.174.8.95.nip.io # Хост №1. Сертификат должен покрывать этот домен.
+                                     # nip.io автоматически резолвит этот поддомен в IP
+                                     # 10.174.8.95 (наш master-узел).
+        - gateway.10.174.8.95.nip.io # Хост №2. Тоже должен быть в сертификате.
+                                     # ⚠️ Оба хоста покрываются одним wildcard-сертификатом
+                                     # *.10.174.8.95.nip.io — это и есть смысл wildcard!
+      secretName: wildcard-nipio-tls # Имя Secret'а с TLS-парой (cert + key).
+                                     # Создан Certificate-ресурсом wildcard-nipio
+                                     # в namespace default.
+                                     # ingress-nginx прочитает этот Secret и установит
+                                     # сертификат для обоих хостов.
+                                     # ⚠️ Secret и Ingress ДОЛЖНЫ быть в одном namespace!
+                                     # У нас оба в default — OK.
+  rules:                             # Правила маршрутизации: какой запрос куда слать.
+                                     # Здесь — два независимых правила для двух хостов.
+
+    # ─────────────────────────────────────────────
+    # ПРАВИЛО №1: session.10.174.8.95.nip.io
+    # Обрабатывает только тест "Login User" из Postman.
+    # Цель: получить Bearer-токен через Basic Auth.
+    # ─────────────────────────────────────────────
+    - host: session.10.174.8.95.nip.io
+                                     # Правило срабатывает ТОЛЬКО если в HTTP-заголовке
+                                     # Host: session.10.174.8.95.nip.io.
+                                     # Это позволяет на ОДНОМ IP крутить много разных
+                                     # приложений (virtual hosts, как в Nginx).
+      http:
+        paths:                       # Список путей в URL и куда их слать.
+          - path: /                  # Корневой префикс — ловит все пути этого хоста.
+                                     # /api/v1/auth/authorize → попадёт сюда (начинается с /).
+            pathType: Prefix         # Тип сопоставления:
+                                     # Prefix — совпадение по началу пути.
+                                     # "/" совпадает с любым путём (/, /api, /api/v1/auth/...).
+                                     # Альтернативы:
+                                     #   Exact — точное совпадение (только "/").
+                                     #   ImplementationSpecific — на усмотрение контроллера.
+            backend:                 # Куда направить трафик (когда host и path совпали).
+              service:
+                name: session-service# Имя Service'а в этом namespace.
+                                     # Это Service из манифеста 05-session-service.yaml.
+                port:
+                  number: 8081       # Порт Service'а (НЕ пода!).
+                                     # Service сам перенаправит на targetPort: 8081 → под.
+                                     # Согласовано с containerPort и Postman:
+                                     #   USERS_PORT: "8081" (в Postman переменных).
+
+    # ─────────────────────────────────────────────
+    # ПРАВИЛО №2: gateway.10.174.8.95.nip.io
+    # Обрабатывает все остальные тесты (Get Hotels, Book Hotel и т.д.).
+    # Это основная точка входа в систему.
+    # ─────────────────────────────────────────────
+    - host: gateway.10.174.8.95.nip.io
+                                     # Срабатывает на Host: gateway.10.174.8.95.nip.io.
+                                     # Ingress-nginx по этому заголовку разделяет
+                                     # трафик между двумя правилами.
+      http:
+        paths:
+          - path: /                  # Все пути этого хоста идут в gateway.
+                                     # /api/v1/gateway/hotels         → gateway-service
+                                     # /api/v1/gateway/hotels/{uid}   → gateway-service
+                                     # /api/v1/gateway/booking        → gateway-service
+                                     # /api/v1/gateway/loyalty        → gateway-service
+                                     # Внутри gateway-service сам решает, в какой
+                                     # downstream-сервис (hotel/booking/loyalty/report)
+                                     # переслать запрос.
+            pathType: Prefix         # Префикс — пускаем всё, что начинается с /.
+            backend:
+              service:
+                name: gateway-service# Имя Service'а — gateway из 11-gateway-service.yaml.
+                port:
+                  number: 8087       # Порт gateway-service.
+                                     # Согласовано с Postman: GATEWAY_PORT: "8087".
+                                     # И с containerPort в Deployment'е gateway.
+```
+
+---
+
+## 🔗 Полная картина: запрос Postman → внутренний под
+
+### Сценарий 1: Login User (тест 1)
+
+```
+   ┌──────────────────────────────────────────────────────┐
+   │ Postman                                              │
+   │ GET https://session.10.174.8.95.nip.io/api/v1/auth/  │
+   │       authorize                                       │
+   │ Authorization: Basic VXNlcjpxd2VydHk=                 │
+   └──────────────────────┬───────────────────────────────┘
+                          │ HTTPS
+                          ▼
+                ┌──────────────────┐
+                │ DNS: nip.io       │ → резолвит в 10.174.8.95
+                └─────────┬─────────┘
+                          ▼
+            ┌──────────────────────────┐
+            │ k3s master-нода, порт 443 │
+            └──────────────┬───────────┘
+                           ▼
+   ┌──────────────────────────────────────────────────────┐
+   │ Ingress-Nginx Controller (Pod в ns ingress-nginx)    │
+   │                                                       │
+   │ 1. TLS termination:                                  │
+   │    Берёт сертификат из Secret wildcard-nipio-tls     │
+   │    Расшифровывает HTTPS → HTTP                       │
+   │                                                       │
+   │ 2. Смотрит Host: session.10.174.8.95.nip.io          │
+   │    → Находит ПРАВИЛО №1 в app-ingress                │
+   │                                                       │
+   │ 3. Path "/" совпадает с pathType: Prefix             │
+   │                                                       │
+   │ 4. Backend: session-service:8081                     │
+   └──────────────────────┬───────────────────────────────┘
+                          │ HTTP внутри кластера
+                          ▼
+            ┌──────────────────────────┐
+            │ Service session-service   │
+            │ ClusterIP 10.43.X.Y       │
+            └──────────────┬───────────┘
+                           │ kube-proxy iptables
+                           ▼
+            ┌──────────────────────────┐
+            │ Pod session-service-xxx   │
+            │ Spring Boot :8081         │
+            └──────────────┬───────────┘
+                           │
+                           │ Декодирует Basic Auth → User:qwerty
+                           │ Проверяет в БД users_db
+                           ▼
+                  [ PostgreSQL users_db ]
+                           │
+                           ▼
+                  [ Генерирует JWT-токен ]
+                           │
+                           ▼ HTTP 200 OK
+   ← Authorization: Bearer eyJhbGc... → возврат по той же цепочке
+```
+
+### Сценарий 2: Get Hotels (тест 2)
+
+```
+   ┌──────────────────────────────────────────────────────┐
+   │ Postman                                              │
+   │ GET https://gateway.10.174.8.95.nip.io/api/v1/       │
+   │       gateway/hotels                                  │
+   │ Authorization: Bearer eyJhbGc... ← токен из теста 1  │
+   └──────────────────────┬───────────────────────────────┘
+                          │ HTTPS
+                          ▼
+                  [ DNS nip.io → 10.174.8.95 ]
+                          │
+                          ▼
+            [ k3s master-нода, порт 443 ]
+                          │
+                          ▼
+   ┌──────────────────────────────────────────────────────┐
+   │ Ingress-Nginx Controller                             │
+   │ Host: gateway.10.174.8.95.nip.io                     │
+   │ → ПРАВИЛО №2 → backend: gateway-service:8087         │
+   └──────────────────────┬───────────────────────────────┘
+                          ▼
+            [ Service gateway-service ClusterIP ]
+                          ▼
+   ┌──────────────────────────────────────────────────────┐
+   │ Pod gateway-service                                  │
+   │                                                       │
+   │ 1. Извлекает Bearer-токен из заголовка               │
+   │ 2. Валидирует через session-service:                 │
+   │    GET http://session-service:8081/api/v1/auth/      │
+   │        validate                                       │
+   │ 3. Получает userId → авторизация OK                  │
+   │ 4. Маршрутизирует на hotel-service:                  │
+   │    GET http://hotel-service:8082/api/v1/hotels       │
+   │ 5. Получает список отелей                            │
+   │ 6. Возвращает клиенту                                │
+   └──────────────────────────────────────────────────────┘
+                          │
+                          ▼
+                  [ Pod hotel-service:8082 ]
+                          │
+                          ▼
+                  [ PostgreSQL hotels_db ]
+                          │
+                          ▼ HTTP 200 OK + JSON
+                  ← возврат списка отелей
+```
+
+---
+
+## 🌐 Как Ingress связан с остальной системой
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       ВНЕШНИЙ МИР                            │
+│                          (Postman)                           │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       │ session.10.174.8.95.nip.io
+                       │ gateway.10.174.8.95.nip.io
+                       │ (оба резолвятся в 10.174.8.95)
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Ingress-Nginx Controller                                   │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ Сертификат: *.10.174.8.95.nip.io                    │    │
+│  │ Источник: Secret wildcard-nipio-tls                 │    │
+│  │ Подписал: my-ca-issuer (наш CA)                     │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  Правила из app-ingress:                                    │
+│  - Host: session.* → service: session-service:8081          │
+│  - Host: gateway.* → service: gateway-service:8087          │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+       ┌───────────────┴───────────────┐
+       ▼                                ▼
+┌──────────────┐                  ┌──────────────┐
+│   session    │                  │   gateway    │
+│   :8081      │                  │   :8087      │
+└──────┬───────┘                  └──────┬───────┘
+       │                                  │
+       │                  ┌───────────────┼──────────────┬─────────────┐
+       │                  ▼               ▼              ▼             ▼
+       │            [ hotel ]      [ booking ]    [ loyalty ]   [ report ]
+       │             :8082         :8083           :8085         :8086
+       │                                │                              ▲
+       │                                │ event                        │
+       │                                ▼                              │
+       │                       [ RabbitMQ :5672 ]                      │
+       │                                │                              │
+       │                                └──────────────────────────────┘
+       │
+       │ (всё, не имеющее ingress, изолировано)
+       │
+       ▼
+┌──────────────┐
+│ PostgreSQL   │ ← один Pod, 7 БД
+│ :5432        │   (users, hotels, reservations, payments,
+└──────────────┘    balances, statistics)
+                    с PVC postgres-pvc → PV → hostPath на k3s-master
+```
+
+---
+
+## 🆚 Сравнение: один Ingress vs два Ingress'а
+
+Альтернативный дизайн — два отдельных Ingress-ресурса:
+
+```yaml
+# Вариант B: два Ingress'а
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: session-ingress
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [session.10.174.8.95.nip.io]
+      secretName: wildcard-nipio-tls
+  rules:
+    - host: session.10.174.8.95.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: session-service, port: { number: 8081 } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway-ingress
+# ... аналогично для gateway
+```
+
+| Аспект | Один Ingress (наш) | Два Ingress'а |
+|--------|---------------------|----------------|
+| Количество ресурсов | 1 | 2 |
+| Управление | Все правила в одном месте | Распределено |
+| Команда смотрит логи | Простая фильтрация | Сложнее |
+| Удаление одного хоста | Редактируем YAML | Удаляем целый Ingress |
+| GitOps-friendly | Меньше файлов | Больше изолированности |
+
+Оба подхода рабочие. Для нашей лабы один Ingress компактнее и читабельнее.
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> Этот Ingress — финальная сборка проекта: связывает внешний мир с двумя точками входа приложения. Аннотация cert-manager.io/cluster-issuer запускает автовыпуск TLS-сертификата, ingressClassName: nginx направляет в Nginx-контроллер. Секция tls содержит два хоста (session и gateway), оба покрываются wildcard-сертификатом из Secret wildcard-nipio-tls. Два правила маршрутизируют трафик на разные Service'ы по host-заголовку.
+
+*(длина ~440 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Почему два хоста на одном Ingress, а не один хост с разными путями?**
+> Это **архитектурное решение под требование задания**. В пункте 5 ТЗ написано: «сгенерировать **wildcard**-сертификат». Wildcard-сертификат (`*.domain`) имеет смысл только если есть несколько поддоменов:
+> 
+> - **С двумя хостами**: `session.*` и `gateway.*` оба покрываются `*.10.174.8.95.nip.io` — wildcard оправдан.
+> - **С одним хостом**: `app.10.174.8.95.nip.io` — wildcard избыточен, можно было выпустить обычный single-domain сертификат.
+> 
+> Плюс это **архитектурно правильнее**: session и gateway — разные точки входа с разной ответственностью. Логически их разделить через DNS — стандартная практика.
+
+**В2: Что произойдёт, если Secret `wildcard-nipio-tls` не существует?**
+> ingress-nginx запустит Ingress, но **без TLS**:
+> 1. Логи nginx-controller'а покажут: `Secret default/wildcard-nipio-tls does not exist`.
+> 2. HTTPS-запросы будут получать **fake-сертификат** ingress-nginx (cn=ingress.local).
+> 3. Браузер покажет "NET::ERR_CERT_AUTHORITY_INVALID".
+> 4. HTTP (порт 80) продолжит работать без шифрования.
+> 
+> Поскольку у нас есть аннотация `cert-manager.io/cluster-issuer`, cert-manager увидит Ingress без Secret и **автоматически создаст** Certificate-ресурс, который выпустит TLS-пару и положит в Secret. Через ~30 секунд HTTPS заработает корректно.
+
+**В3: Зачем аннотация `cert-manager.io/cluster-issuer`, если Certificate уже создан отдельно?**
+> Это **дублирующая защита** (defense in depth):
+> 
+> 1. **Сейчас**: Secret уже создан явным Certificate-ресурсом (wildcard-cert.yaml).
+> 2. **Если бы Certificate забыли**: аннотация запустила бы автогенерацию.
+> 
+> Если оба подхода работают одновременно — никакого конфликта:
+> - cert-manager увидит, что Secret уже существует.
+> - Сверит cn/dnsNames с тем, что нужно по Ingress.
+> - Если совпадает — ничего не делает.
+> - Если отличается — попробует обновить.
+> 
+> Лишним этот approach не назову — больше как страховка.
+
+**В4: Что произойдёт, если убрать `ingressClassName: nginx`?**
+> Зависит от того, есть ли в кластере **default IngressClass**:
+> 
+> 1. **Если есть default IngressClass** (с `is-default-class: "true"`): Ingress обработает контроллер по умолчанию. У нас, скорее всего, это nginx → всё заработает.
+> 
+> 2. **Если default нет**: Ingress останется без обработчика, никакой контроллер его не подхватит. В `kubectl describe ingress` будет warning: "no IngressClass found".
+> 
+> Лучшая практика — **всегда указывать ingressClassName явно**. Это:
+> - Явная зависимость, видно из манифеста.
+> - Защита от смены default'а.
+> - Работа в кластере с несколькими контроллерами (nginx + traefik).
+
+**В5: Где терминируется TLS — на Ingress или на gateway?**
+> На **Ingress-Nginx**! Это паттерн **TLS termination at the edge**:
+> 
+> 1. Клиент → HTTPS → Ingress (расшифровывает) → HTTP → внутренние сервисы.
+> 2. Внутри кластера трафик идёт **по обычному HTTP**.
+> 
+> Плюсы:
+> - **Производительность**: один раз расшифровать на входе, дальше быстро.
+> - **Управление сертификатами централизованно**: cert-manager обновляет → Ingress подхватывает. Сервисы ничего не знают про TLS.
+> - **Простота приложения**: gateway, session, hotel и т.д. — обычный HTTP, никакой возни с keystore.
+> 
+> Минусы:
+> - **Внутри кластера трафик в открытом виде**. Если в кластере есть злоумышленник — может перехватить.
+> - **Решение**: Service Mesh (Istio, Linkerd) для mTLS между всеми сервисами.
+
+**В6: Что произойдёт, если оба правила имеют одинаковый path "/"?**
+> Конфликта нет! Правила в Ingress различаются по **host**:
+> - Host `session.*` → правило №1 → session-service.
+> - Host `gateway.*` → правило №2 → gateway-service.
+> 
+> Один path `/` встречается в обоих, но в разных host-блоках. ingress-nginx сначала фильтрует по host (HTTP-заголовок Host), потом по path.
+> 
+> Конфликт был бы, если бы в одном host-блоке были два правила с одинаковым path — ingress-nginx применит **последнее** (или первое, зависит от реализации). Лучше так не делать.
+
+**В7: Что если http-запрос придёт без указания host (например, прямо на IP)?**
+> ingress-nginx применит **default-backend** (404 page). Не найдёт соответствующего правила и вернёт стандартную ошибку:
+> ```
+> HTTP/1.1 404 Not Found
+> Server: nginx
+> 
+> 404 Not Found
+> ```
+> 
+> Можно настроить **catch-all rule** (правило без host) — оно сработает, если ни один host-rule не подошёл:
+> ```yaml
+> rules:
+>   - http:        # ← без host:
+>       paths:
+>         - path: /
+>           pathType: Prefix
+>           backend:
+>             service: { name: default-app, port: { number: 80 } }
+> ```
+> 
+> Это полезно для дефолтных страниц или редиректов на основной домен.
+
+**В8: Безопасно ли публиковать session-service отдельным хостом?**
+> Это вопрос архитектуры:
+> 
+> **За (наш вариант)**:
+> - Чёткое разделение: один эндпоинт для логина, другой для бизнес-API.
+> - Можно применять разные политики: rate limiting на login строже, чтобы избежать brute-force.
+> - Можно ограничить доступ к login по IP (например, только корпоративная сеть).
+> 
+> **Против (gateway-only)**:
+> - Меньше attack surface: только один внешний хост.
+> - Все запросы проходят через gateway, упрощённый мониторинг.
+> - Но: чтобы получить токен, всё равно нужен механизм без аутентификации.
+> 
+> На практике часто делают **прокси через gateway**: `gateway/api/v1/auth/login` → gateway проксирует на session. Тогда session-service внутренний, как все остальные. Но в нашем учебном проекте session = отдельный entry point для демонстрации wildcard-сертификата.
+
+**В9: Что если у двух хостов будут разные сертификаты?**
+> Тогда секция tls будет содержать **два блока**:
+> ```yaml
+> tls:
+>   - hosts: [session.10.174.8.95.nip.io]
+>     secretName: session-tls
+>   - hosts: [gateway.10.174.8.95.nip.io]
+>     secretName: gateway-tls
+> ```
+> 
+> ingress-nginx использует **SNI** (Server Name Indication) — клиент в TLS-handshake передаёт имя хоста, и nginx выбирает соответствующий сертификат.
+> 
+> В нашем случае один wildcard покрывает оба → один Secret и одна tls-запись. Это проще.
+
+**В10: Как Ingress-Nginx выбирает Backend?**
+> Алгоритм такой:
+> 
+> 1. **Host matching**: ищет правило с подходящим `host:` в Ingress'ах в том же namespace, что и Service.
+> 2. **Path matching**: внутри найденного host-блока ищет правило с подходящим path (по pathType).
+> 3. **Service lookup**: находит Service по имени в backend.service.name.
+> 4. **Endpoint resolution**: получает список endpoint'ов (адресов подов) этого Service.
+> 5. **Load balancing**: выбирает один endpoint (по умолчанию round-robin).
+> 6. **Proxy**: отправляет запрос на endpoint:targetPort.
+> 
+> Если на шаге 3 Service не найден — 503 Service Unavailable.
+> Если на шаге 4 список endpoint'ов пуст (под не Ready) — 503.
+
+**В11: Что произойдёт при удалении этого Ingress?**
+> 1. ingress-nginx перестаёт обрабатывать правила для session.* и gateway.*.
+> 2. Запросы извне на эти хосты → 404 Not Found.
+> 3. Внутренние Service'ы и Pod'ы продолжают работать, но недоступны снаружи.
+> 4. Из других подов в кластере по-прежнему можно ходить: `curl http://gateway-service:8087`.
+> 5. Secret wildcard-nipio-tls **остаётся** (не привязан к Ingress напрямую).
+> 6. Certificate-ресурс тоже остаётся, продолжит обновляться.
+
+**В12: Можно ли добавить редирект с HTTP на HTTPS?**
+> Да, через аннотацию ingress-nginx:
+> ```yaml
+> annotations:
+>   nginx.ingress.kubernetes.io/ssl-redirect: "true"          # default true
+>   nginx.ingress.kubernetes.io/force-ssl-redirect: "true"    # даже без tls в spec
+> ```
+> 
+> По умолчанию `ssl-redirect: "true"` для Ingress'ов с tls-секцией. Это значит: запрос на http://session.10.174.8.95.nip.io автоматически вернёт 308 Redirect на https://...
+> 
+> У нас в Ingress есть tls-секция → редирект уже работает по умолчанию.
+
+**В13: Как добавить rate limiting?**
+> Через аннотации ingress-nginx:
+> ```yaml
+> annotations:
+>   nginx.ingress.kubernetes.io/limit-rps: "10"        # 10 requests per second per IP
+>   nginx.ingress.kubernetes.io/limit-rpm: "60"        # 60 per minute
+>   nginx.ingress.kubernetes.io/limit-connections: "5" # max 5 concurrent
+> ```
+> 
+> Это применяется на уровне ingress-nginx, до того как запрос дойдёт до Spring Boot. Защита от DDoS, brute-force на login и т.д.
+
+**В14: Как мониторить Ingress?**
+> ingress-nginx экспортирует Prometheus-метрики из коробки:
+> - `nginx_ingress_controller_requests` — счётчик запросов с лейблами (host, status, method).
+> - `nginx_ingress_controller_response_duration_seconds` — latency.
+> - `nginx_ingress_controller_request_size_bytes` — размер запросов.
+> 
+> Можно настроить Grafana-дашборд: трафик по хостам, error rate, p95-latency. Это особенно важно для production-наблюдения.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀

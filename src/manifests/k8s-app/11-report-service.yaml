@@ -52,3 +52,472 @@ spec:
     - port: 8086
       targetPort: 8086
   type: ClusterIP
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор Deployment + Service для report-service
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment report-service
+# Микросервис аналитики и статистики.
+# Уникален тем, что — единственный CONSUMER RabbitMQ в системе.
+# Не принимает HTTP-запросов от других сервисов (или почти),
+# а слушает события и накапливает статистику в своей БД.
+#
+# Поток работы:
+#   1. booking-service публикует событие "новая бронь" → RabbitMQ.
+#   2. RabbitMQ → очередь booking_statistics_queue.
+#   3. report-service подписан → читает сообщение.
+#   4. Парсит, агрегирует, пишет в statistics_db.
+#   5. Через HTTP-эндпоинт можно запросить отчёт (статистику).
+# ============================================================
+apiVersion: apps/v1                  # API-группа apps, версия v1.
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: report-service               # Имя Deployment'а.
+  labels: { app: report-service }    # Метка на Deployment (inline YAML).
+spec:
+  replicas: 1                        # Одна реплика для лабы.
+                                     # ⚠️ Для message consumer'а:
+                                     # - Несколько реплик = competing consumers,
+                                     #   сообщения распределяются между ними round-robin.
+                                     # - Это горизонтальное масштабирование "из коробки".
+                                     # - НО: порядок обработки сообщений может нарушиться!
+                                     #   Если важен ordering — нужен один consumer на queue.
+  selector:
+    matchLabels: { app: report-service }
+                                     # Селектор подов Deployment'а.
+  template:                          # Шаблон создаваемых подов.
+    metadata:
+      labels: { app: report-service }
+                                     # Метка пода — совпадает с селектором.
+    spec:
+      containers:
+        - name: report-service       # Имя контейнера в поде.
+          image: src-report-service:latest
+                                     # Локальный образ Spring Boot из DO10.
+                                     # Содержит:
+                                     # - Spring AMQP (RabbitMQ Listener).
+                                     # - Spring Data JPA для записи в БД.
+                                     # - REST controllers для отдачи отчётов.
+          imagePullPolicy: Never     # Только локальный образ из containerd k3s.
+                                     # Образ заранее импортирован:
+                                     #   k3s ctr images import report-service.tar
+          ports:
+            - containerPort: 8086    # Порт Spring Boot.
+                                     # Согласован с ConfigMap (REPORT_SERVICE_PORT: "8086").
+                                     # ⚠️ Этот порт реально нужен ТОЛЬКО для HTTP-эндпоинтов
+                                     # запроса статистики. AMQP-подписка работает наоборот:
+                                     # сам report-service инициирует TCP-коннект к RabbitMQ.
+                                     # В Postman-тестах этот сервис НЕ дёргается напрямую.
+          env:                       # 10 переменных — БОЛЬШЕ, чем у листовых сервисов
+                                     # (5 у hotel/payment/loyalty), потому что нужен RabbitMQ.
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-1: Подключение к PostgreSQL
+            # statistics_db — отдельная БД для агрегированных данных.
+            # ─────────────────────────────────────────────
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: POSTGRES_HOST # → "postgres"
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: POSTGRES_PORT }
+                                     # → "5432"
+            - name: POSTGRES_DB
+              value: statistics_db   # ⚠️ Своя БД! Историческое название из DO10.
+                                     # Внутри типичные таблицы:
+                                     #   bookings_stats (date, count, total_revenue)
+                                     #   user_activity (user_id, action_count)
+                                     #   hotel_popularity (hotel_id, bookings_count)
+                                     # БД создаётся init-скриптом образа src-postgres.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_USER }
+                                     # Логин postgres из Secret.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD }
+                                     # Пароль из Secret.
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-2: Подключение к RabbitMQ
+            # report-service — CONSUMER, подписывается на очередь.
+            # Зеркальная конфигурация с producer'ом (booking-service).
+            # Имена exchange/queue ОБЯЗАНЫ совпадать — иначе сообщения
+            # просто не дойдут.
+            # ─────────────────────────────────────────────
+            - name: RABBIT_MQ_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: RABBIT_MQ_HOST }
+                                     # → "rabbitmq"
+            - name: RABBIT_MQ_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: RABBIT_MQ_PORT }
+                                     # → "5672"
+            - name: RABBIT_MQ_QUEUE_NAME
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: RABBIT_MQ_QUEUE_NAME }
+                                     # → "booking_statistics_queue"
+                                     # ⚠️ ТО ЖЕ имя, что у booking-service!
+                                     # booking publish → queue
+                                     # report subscribe ← queue
+                                     # Без совпадения — события теряются.
+            - name: RABBIT_MQ_EXCHANGE
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: RABBIT_MQ_EXCHANGE }
+                                     # → "booking_statistics_exchange"
+                                     # Тоже должно совпадать с booking-service.
+                                     # Хотя в некоторых реализациях consumer не использует
+                                     # exchange напрямую (читает из queue), Spring AMQP
+                                     # обычно использует для declaration (создания привязки).
+            - name: RABBIT_MQ_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: RABBIT_MQ_USER }
+                                     # → "guest"
+            - name: RABBIT_MQ_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: RABBIT_MQ_PASSWORD }
+                                     # → "guest"
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для report-service
+# Открывает HTTP-порт для запросов статистики (опционально).
+# AMQP-подписка работает БЕЗ Service'а — это исходящее соединение.
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Балансировщик + DNS-имя.
+metadata:
+  name: report-service               # КЛЮЧЕВОЕ! По имени резолвится через CoreDNS.
+                                     # В ConfigMap: REPORT_SERVICE_HOST: report-service
+                                     # ⚠️ Кто к нему ходит?
+                                     # В Postman-тестах нет вызовов /report.
+                                     # Возможно, через gateway/admin доступны эндпоинты
+                                     # вроде /api/v1/reports/bookings.
+                                     # Но в основном report — пассивный consumer.
+  labels: { app: report-service }    # Метка на Service'е.
+spec:
+  selector: { app: report-service }  # Трафик в поды с этим лейблом.
+  ports:
+    - port: 8086                     # Порт Service'а — входящий.
+      targetPort: 8086               # Порт пода (= containerPort).
+  type: ClusterIP                    # Только из кластера.
+                                     # Снаружи не выставлен.
+```
+
+---
+
+## 🔗 Уникальная роль report-service: pub-sub архитектура
+
+Все остальные сервисы общаются **синхронно через HTTP**. report-service — единственный, кто работает **асинхронно через сообщения**:
+
+```
+   [ booking-service ]
+            │
+            │ POST /api/v1/bookings обрабатывается клиентом
+            │
+            │ После сохранения брони:
+            ▼
+   ┌────────────────────────────────────────────────┐
+   │ AMQP Publish:                                   │
+   │   exchange: booking_statistics_exchange         │
+   │   routing-key: booking.created                  │
+   │   body: {                                       │
+   │     bookingUid, userId, hotelUid,               │
+   │     amount, dateInterval, timestamp             │
+   │   }                                             │
+   └─────────────────┬───────────────────────────────┘
+                     │ TCP/AMQP к rabbitmq:5672
+                     ▼
+   ┌─────────────────────────────────────────────────┐
+   │ RabbitMQ Pod                                     │
+   │                                                  │
+   │ exchange: booking_statistics_exchange            │
+   │           │                                      │
+   │           ▼ binding                              │
+   │ queue:    booking_statistics_queue               │
+   │   [msg-1] [msg-2] [msg-3] ...                    │
+   └─────────────────┬───────────────────────────────┘
+                     │ постоянное TCP-соединение
+                     │ (исходящее от report-service!)
+                     ▼
+   ┌─────────────────────────────────────────────────┐
+   │ Pod report-service                               │
+   │                                                  │
+   │ @RabbitListener(queues = "booking_statistics_queue")│
+   │ void onBookingCreated(BookingEvent event) {     │
+   │   // 1. Парсим событие                          │
+   │   // 2. INSERT в statistics_db                   │
+   │   // 3. Обновляем агрегаты                      │
+   │ }                                                │
+   └─────────────────┬───────────────────────────────┘
+                     │
+                     ▼
+   ┌─────────────────────────────────────────────────┐
+   │ PostgreSQL: statistics_db                        │
+   │  - bookings_stats                                │
+   │  - user_activity                                 │
+   │  - hotel_popularity                              │
+   └─────────────────────────────────────────────────┘
+```
+
+**Ключевая особенность:** соединение с RabbitMQ инициирует **сам** report-service. Никакой Service не нужен для consume-логики. Service на 8086 нужен только для HTTP-эндпоинтов запроса статистики (если они есть).
+
+---
+
+## 🔄 Зеркальная конфигурация booking ↔ report
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│           booking-service             ⟷    report-service    │
+│           (PUBLISHER)                      (SUBSCRIBER)       │
+├──────────────────────────────────────────────────────────────┤
+│  RABBIT_MQ_HOST: rabbitmq             ✅ rabbitmq             │
+│  RABBIT_MQ_PORT: 5672                 ✅ 5672                 │
+│  RABBIT_MQ_QUEUE: booking_stat_queue  ✅ booking_stat_queue   │
+│  RABBIT_MQ_EXCHANGE: booking_stat_x   ✅ booking_stat_x       │
+│  RABBIT_MQ_USER: guest                ✅ guest                │
+│  RABBIT_MQ_PASSWORD: guest            ✅ guest                │
+└──────────────────────────────────────────────────────────────┘
+                          │
+                          │ Эти 6 значений ОБЯЗАНЫ совпадать!
+                          │ Берутся из общего ConfigMap + Secret —
+                          │ гарантия консистентности.
+```
+
+Это **критически важная инвариант**: при изменении любого из этих значений нужно обновить ConfigMap/Secret и **перезапустить оба** сервиса. Иначе:
+- booking публикует в exchange-A, а report слушает exchange-B → события теряются.
+- Или сообщения копятся в очереди, потому что consumer не подписан.
+
+---
+
+## 🆚 Сравнение report-service с другими сервисами
+
+| Свойство | hotel | payment | loyalty | **report** | booking |
+|----------|-------|---------|---------|-----------|---------|
+| Env-переменных | 5 | 5 | 5 | **10** | 18 |
+| Своя БД | hotels_db | payments_db | balances_db | **statistics_db** | reservations_db |
+| HTTP API | ✅ (для других) | ✅ | ✅ | **✅ (для отчётов)** | ✅ |
+| RabbitMQ Producer | ❌ | ❌ | ❌ | **❌** | ✅ |
+| RabbitMQ Consumer | ❌ | ❌ | ❌ | **✅** | ❌ |
+| Кого вызывает | никого | никого | никого | **никого** | hotel, payment, loyalty |
+| Уникальная роль | каталог | финансы | бонусы | **аналитика** | оркестратор |
+
+report-service — это **promiscuous consumer**: пассивно ждёт события, но активно использует множество ресурсов (БД + RabbitMQ).
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> report-service — сервис аналитики, единственный consumer RabbitMQ в системе. Подписан на очередь booking_statistics_queue, куда booking-service публикует события о новых бронях. Deployment с одной репликой на порту 8086, своя БД statistics_db. В env-секции 10 переменных: подключения к PostgreSQL и к RabbitMQ. Конфигурация AMQP зеркально совпадает с booking-service, что обеспечивает корректную доставку сообщений.
+
+*(длина ~450 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Чем report-service принципиально отличается от других "листовых" сервисов?**
+> Тремя ключевыми вещами:
+> 
+> 1. **Pull vs Push**: hotel/payment/loyalty получают **синхронные HTTP-запросы**. report — асинхронно **слушает события** из RabbitMQ.
+> 
+> 2. **Никто его не вызывает напрямую** для записи данных. Все данные приходят через очередь. HTTP-API нужен только для отдачи отчётов.
+> 
+> 3. **Eventual consistency**: между моментом создания брони в booking и появлением её в statistics_db есть задержка (миллисекунды-секунды). Это нормально для аналитики.
+> 
+> Это **CQRS-подобный паттерн**: write-модель в booking, read-модель в report.
+
+**В2: Что произойдёт, если report-service упадёт на час?**
+> События **не потеряются**! Это главное преимущество message-driven архитектуры:
+> 
+> 1. booking-service продолжит публиковать в RabbitMQ.
+> 2. RabbitMQ накапливает сообщения в очереди (если queue durable).
+> 3. Через час report-service запустится → подключится → начнёт читать с самого первого непрочитанного сообщения.
+> 4. Постепенно догонит и обработает накопившееся.
+> 
+> Сравним с синхронным HTTP: если loyalty-service лежит час, все вызовы booking → loyalty за этот час провалятся, данные потеряются.
+> 
+> Это **resilience by design** — встроенная отказоустойчивость через очереди.
+
+**В3: Что если RabbitMQ перезапустится — потеряются ли сообщения?**
+> Зависит от настроек **durability**:
+> 
+> 1. **Durable queue** (`durable: true`) — определение очереди переживает рестарт.
+> 2. **Persistent message** (`delivery_mode = 2`) — само сообщение пишется на диск.
+> 3. **Durable exchange** — определение exchange сохраняется.
+> 
+> Spring AMQP по умолчанию создаёт queue/exchange durable. Сообщения — persistent при `MessagePostProcessor`.
+> 
+> ⚠️ **У нас в манифесте НЕТ PVC для RabbitMQ!** Это значит:
+> - При перезапуске пода RabbitMQ — данные `/var/lib/rabbitmq` теряются.
+> - Все накопленные сообщения исчезают.
+> - Это **критический технический долг для продакшна**.
+> 
+> Для production нужен PVC к RabbitMQ, как у PostgreSQL.
+
+**В4: Что произойдёт, если в `RABBIT_MQ_QUEUE_NAME` указать неверное имя?**
+> Сценарий: booking publish в `booking_statistics_queue`, а report listens `wrong_queue`.
+> 
+> Результат:
+> 1. Spring AMQP при старте report-service создаст очередь `wrong_queue` (с `Queue.declare()`).
+> 2. Очередь будет пустая — booking туда ничего не пишет.
+> 3. Тем временем `booking_statistics_queue` накапливает события, но никто их не читает.
+> 4. Postman-тесты пройдут (они не проверяют события), но статистика в БД пуста.
+> 
+> Это самый коварный bug: всё запустилось, но не работает.
+
+**В5: Можно ли запускать report-service в нескольких репликах?**
+> Да, и это **естественное масштабирование** для consumer'ов. Сценарий:
+> - 3 пода report-service подписаны на одну очередь.
+> - RabbitMQ балансирует сообщения round-robin между ними (competing consumers pattern).
+> - Сообщение #1 → pod-A, #2 → pod-B, #3 → pod-C, #4 → pod-A, ...
+> 
+> Каждый под обрабатывает независимо и пишет в одну БД.
+> 
+> ⚠️ Важно: **порядок обработки** между подами не гарантирован! Если событие "бронь создана" и "бронь отменена" попадут на разные поды — может обработаться сначала отмена, потом создание. Решения:
+> 1. **Ordering by key**: настроить RabbitMQ так, чтобы все события одного booking_uid шли в один под (consistent hashing).
+> 2. **Идемпотентная обработка**: проверка last_event_timestamp в БД.
+
+**В6: Зачем report-service порт 8086, если он только слушает RabbitMQ?**
+> Для **HTTP-эндпоинтов запроса отчётов**. В реальном проекте report-service обычно предоставляет:
+> ```
+> GET /api/v1/reports/bookings/daily?from=2024-01-01&to=2024-01-31
+> GET /api/v1/reports/users/{userId}/activity
+> GET /api/v1/reports/hotels/popularity
+> POST /api/v1/reports/export?format=pdf
+> ```
+> 
+> Эти эндпоинты вызывает либо gateway (для админских отчётов), либо отдельный admin-frontend. Без HTTP-порта данные были бы "тёмной зоной" — пишутся, но никто не видит.
+
+**В7: Если report-service упал прямо во время обработки сообщения — потеряется ли это сообщение?**
+> Зависит от настройки **acknowledge** в AMQP:
+> 
+> 1. **Auto-ack** (`ack=auto`): RabbitMQ удаляет сообщение из очереди СРАЗУ при отправке consumer'у. Если consumer упал до обработки — сообщение потеряно.
+> 
+> 2. **Manual-ack** (`ack=manual`): consumer должен сам отправить `basic.ack` после успешной обработки. Если упал — RabbitMQ через timeout вернёт сообщение в очередь (redelivery).
+> 
+> Spring AMQP по умолчанию использует `AUTO` (что на самом деле = manual-ack после успешного выполнения метода). При падении сообщение возвращается.
+> 
+> ⚠️ Это значит **возможна повторная обработка** одного сообщения → нужно проектировать handler **идемпотентным**:
+> ```java
+> @Transactional
+> void onBookingCreated(BookingEvent event) {
+>   // Проверка дубликата
+>   if (statsRepository.existsByBookingUid(event.bookingUid)) return;
+>   // Обработка
+>   statsRepository.save(...);
+> }
+> ```
+
+**В8: Зачем у report-service отдельная БД statistics_db, а не общий "DWH"?**
+> Принцип **Database per Service** (как и у других сервисов):
+> 
+> 1. **Изоляция**: статистика — это отдельная аналитическая база, может иметь свою схему, оптимизированную под чтение (агрегаты, материализованные view).
+> 2. **Независимость**: можно мигрировать с PostgreSQL на ClickHouse / TimescaleDB без влияния на booking.
+> 3. **Производительность**: тяжёлые аналитические запросы не блокируют боевую базу.
+> 
+> В реальном крупном проекте statistics_db эволюционирует в **OLAP-хранилище** (ClickHouse, Snowflake), а текущая PostgreSQL остаётся для OLTP. Архитектурно отделение — первый шаг к этому.
+
+**В9: Что произойдёт при `kubectl rollout restart deploy/report-service`?**
+> 1. Создаётся новый под report-service-v2.
+> 2. Spring Boot стартует → подключается к RabbitMQ → подписывается на queue.
+> 3. RabbitMQ видит нового consumer'а и начинает слать ему сообщения.
+> 4. Старый под получает SIGTERM → graceful shutdown.
+>    - Должен завершить обработку текущего сообщения и отправить ack.
+>    - Закрыть AMQP-соединение чисто.
+> 5. RabbitMQ автоматически переадресует не отправленные сообщения новому поду.
+> 
+> Zero-downtime restart работает, **если** consumer корректно обрабатывает SIGTERM. Spring AMQP это делает из коробки.
+
+**В10: Какой Postman-тест проверяет работу report-service?**
+> Прямого теста **нет** в коллекции! Тесты:
+> 1. Login User
+> 2. Get Hotels
+> 3. Get Hotel
+> 4. Book Hotel
+> 5. Get User's Loyalty Balance
+> 
+> Никто не дёргает report-service напрямую. Это **косвенный** компонент.
+> 
+> Чтобы проверить его работу:
+> - После теста "Book Hotel" зайти в RabbitMQ Web UI (`kubectl port-forward svc/rabbitmq 15672`).
+> - Посмотреть, что в `booking_statistics_queue` сообщения приходят и потребляются.
+> - Зайти в БД `statistics_db` и проверить, что появились записи.
+> 
+> Можно добавить тест:
+> ```
+> GET /api/v1/reports/bookings/last
+> ```
+> и проверить, что только что созданная бронь видна в статистике (с retry, т.к. eventual consistency).
+
+**В11: Что хранится в `statistics_db`? Типичные таблицы?**
+> Предположительная схема:
+> ```sql
+> -- Сырые события (необязательно)
+> CREATE TABLE booking_events (
+>   id BIGSERIAL PRIMARY KEY,
+>   booking_uid UUID UNIQUE,
+>   user_id BIGINT,
+>   hotel_uid UUID,
+>   amount NUMERIC(10,2),
+>   created_at TIMESTAMP
+> );
+> 
+> -- Дневные агрегаты
+> CREATE TABLE daily_stats (
+>   date DATE PRIMARY KEY,
+>   bookings_count INT,
+>   total_revenue NUMERIC(15,2),
+>   unique_users INT
+> );
+> 
+> -- Топ отелей
+> CREATE MATERIALIZED VIEW hotel_popularity AS
+>   SELECT hotel_uid, COUNT(*) as bookings
+>   FROM booking_events
+>   GROUP BY hotel_uid;
+> ```
+> 
+> Реальная схема зависит от кода Spring Boot в src-report-service.
+
+**В12: Можно ли убрать HTTP-порт у report-service, если он только consumer?**
+> Технически — да, если бы был чистый consumer без эндпоинтов. Тогда:
+> - Убрать `containerPort: 8086` из Deployment.
+> - Удалить Service полностью (не нужен).
+> - Spring Boot всё равно стартует — он сам коннектится к RabbitMQ исходящим соединением.
+> 
+> Но обычно оставляют HTTP по двум причинам:
+> 1. **Health checks**: k8s readiness/liveness probes стучатся на `/actuator/health`.
+> 2. **Metrics**: Prometheus скрапит `/actuator/prometheus`.
+> 3. **API для запроса отчётов**.
+> 
+> Без HTTP сложно мониторить и интегрировать с экосистемой.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀

@@ -54,3 +54,356 @@ spec:
     - port: 5432
       targetPort: 5432
   type: ClusterIP
+
+
+
+
+# 📝 Построчный разбор Deployment + Service для PostgreSQL
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment PostgreSQL
+# Запускает СТРОГО ОДИН под с базой данных.
+# Использует PVC для постоянного хранения данных.
+# Привязан к конкретной ноде, где лежит hostPath PV.
+# ⚠️ Для production обычно используют StatefulSet, но для
+# одиночной БД с PVC Deployment тоже работает.
+# ============================================================
+apiVersion: apps/v1                  # API-группа "apps", версия v1.
+                                     # Стандартная для Deployment, StatefulSet, DaemonSet.
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: postgres                     # Имя Deployment'а.
+                                     # ВАЖНО: совпадает с именем Service ниже —
+                                     # это удобно, но не обязательно.
+  labels:
+    app: postgres                    # Метка на сам Deployment (не на поды!).
+                                     # Удобна для группировки в kubectl:
+                                     #   kubectl get deploy -l app=postgres
+spec:
+  replicas: 1                        # СТРОГО ОДНА реплика! Это критически важно для БД.
+                                     # PostgreSQL — однописатель: несколько подов с одним PVC
+                                     # = повреждение данных. Никогда не ставь больше 1!
+                                     # Для master-replica нужна другая архитектура
+                                     # (StatefulSet + streaming replication).
+  strategy:
+    type: Recreate                   # Стратегия обновления. Recreate = "убить старый,
+                                     # потом запустить новый". Будет downtime в несколько секунд.
+                                     # Альтернатива: RollingUpdate (default) — постепенная замена.
+                                     # Для БД RollingUpdate НЕЛЬЗЯ! Два пода одновременно
+                                     # попытались бы использовать один PVC (RWO) → конфликт.
+                                     # Recreate гарантирует: всегда только 1 под живой.
+  selector:
+    matchLabels:
+      app: postgres                  # Селектор подов: какие поды считать "своими".
+                                     # Должен совпадать с template.metadata.labels.
+  template:                          # ШАБЛОН пода.
+    metadata:
+      labels:
+        app: postgres                # Метка на каждом создаваемом поде.
+                                     # По ней Service найдёт под (см. блок 2).
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k3s-master
+                                     # ВАЖНО! Прибиваем под к конкретной ноде.
+                                     # Почему: наш PV — это hostPath на k3s-master.
+                                     # Если под уедет на worker — данных там не будет!
+                                     # nodeSelector — простой вариант (vs nodeAffinity в PV).
+                                     # Альтернатива: можно положиться только на nodeAffinity
+                                     # PV — scheduler сам поставит под куда надо.
+                                     # Но дублирование надёжнее и явнее.
+      containers:
+        - name: postgres             # Имя контейнера внутри пода.
+          image: src-postgres:latest # Имя Docker-образа.
+                                     # ⚠️ "src-postgres:latest" — это ЛОКАЛЬНЫЙ образ,
+                                     # собранный командой docker build из проекта DO10.
+                                     # Это кастомная PostgreSQL с init-скриптами,
+                                     # создающими 6 баз для разных сервисов.
+                                     # latest — анти-паттерн в продакшне (нет версионности),
+                                     # но для лабы ОК.
+          imagePullPolicy: Never     # КЛЮЧЕВОЕ для работы с локальными образами!
+                                     # Never = "никогда не качай из registry,
+                                     # используй ТОЛЬКО локальный образ на ноде".
+                                     # Без этого k3s попытается скачать src-postgres из Docker Hub
+                                     # и получит 404 (там такого образа нет).
+                                     # ⚠️ Образ должен быть импортирован в k3s containerd!
+                                     # См. команды: k3s ctr images import <tar>
+                                     # Другие значения:
+                                     #   Always — всегда тянуть из registry (default для :latest)
+                                     #   IfNotPresent — тянуть только если локально нет
+          ports:
+            - containerPort: 5432    # Порт, на котором слушает PostgreSQL внутри контейнера.
+                                     # Стандартный для PostgreSQL.
+                                     # Это документирующее поле; реальную маршрутизацию
+                                     # делает Service в блоке 2.
+          env:                       # Переменные окружения для PostgreSQL.
+                                     # Образ postgres (и наш src-postgres) читает эти env
+                                     # при первом запуске и инициализирует БД.
+            - name: POSTGRES_USER    # Логин суперпользователя БД.
+              valueFrom:             # Берём не из plain value, а из Secret.
+                secretKeyRef:        # Тип источника: Secret.
+                  name: app-secrets  # Имя Secret'а (тот, что мы разбирали ранее).
+                  key: POSTGRES_USER # Конкретный ключ внутри Secret'а.
+                                     # k8s сам декодирует base64 при инъекции в под.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD }
+                                     # Inline-синтаксис YAML — короче, но менее читаемо.
+                                     # Эквивалентно блочной записи выше.
+            - name: POSTGRES_DB
+              value: postgres        # Имя БД, создаваемой при первом запуске.
+                                     # ⚠️ Это plain value, не из Secret.
+                                     # "postgres" — стандартное имя дефолтной БД.
+                                     # Скорее всего, реальные БД создаются init-скриптами
+                                     # в кастомном образе (booking_db, hotel_db и т.д.).
+            - name: PGDATA           # КЛЮЧЕВАЯ переменная для PostgreSQL!
+              value: /var/lib/postgresql/data/pgdata
+                                     # Путь, где PostgreSQL хранит свои файлы данных.
+                                     # ⚠️ ОБЯЗАТЕЛЬНО подкаталог pgdata (не корень тома)!
+                                     # Причина: hostPath-том монтируется с lost+found
+                                     # (если EXT4) и init PostgreSQL падает с ошибкой
+                                     # "data directory is not empty".
+                                     # Подкаталог обходит эту проблему: lost+found остаётся
+                                     # в /var/lib/postgresql/data, а данные БД — в /pgdata.
+          volumeMounts:              # Монтирование томов внутрь контейнера.
+            - name: postgres-storage # Имя тома (определено ниже в volumes).
+              mountPath: /var/lib/postgresql/data
+                                     # Путь ВНУТРИ контейнера, куда монтируется том.
+                                     # Это стандартный путь, где PostgreSQL хранит данные.
+                                     # Внутри будет /pgdata (из-за PGDATA выше).
+      volumes:                       # Описание томов, доступных поду.
+        - name: postgres-storage     # Имя тома (используется в volumeMounts).
+          persistentVolumeClaim:
+            claimName: postgres-pvc  # Ссылка на PVC из предыдущего манифеста.
+                                     # PVC, в свою очередь, связан с PV postgres-pv,
+                                     # который указывает на /var/lib/postgres-pv на ноде.
+                                     # Цепочка:
+                                     #   контейнер /var/lib/postgresql/data/pgdata
+                                     #     → volume postgres-storage
+                                     #     → PVC postgres-pvc
+                                     #     → PV postgres-pv
+                                     #     → hostPath /var/lib/postgres-pv/pgdata на k3s-master
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для PostgreSQL
+# Даёт стабильное DNS-имя "postgres" внутри кластера.
+# Без него остальные микросервисы не смогли бы найти БД.
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Сервис = балансировщик + DNS-имя.
+metadata:
+  name: postgres                     # Имя Service'а. КЛЮЧЕВОЕ!
+                                     # По этому имени микросервисы обращаются к БД:
+                                     #   jdbc:postgresql://postgres:5432/booking_db
+                                     # ConfigMap содержит: POSTGRES_HOST: postgres
+                                     # CoreDNS резолвит "postgres" → ClusterIP этого Service.
+  labels:
+    app: postgres                    # Метка на самом Service (для kubectl).
+spec:
+  selector:
+    app: postgres                    # Селектор подов: трафик пойдёт в поды с этим лейблом.
+                                     # У нас один такой под — из Deployment выше.
+                                     # Service балансирует между ВСЕМИ подходящими подами,
+                                     # но у нас replicas: 1, поэтому балансировки нет.
+  ports:
+    - port: 5432                     # Порт самого Service'а.
+                                     # Под этим портом видят его другие поды:
+                                     #   postgres:5432
+      targetPort: 5432               # Порт пода (того, что слушает PostgreSQL).
+                                     # Совпадает с containerPort из Deployment.
+  type: ClusterIP                    # Тип Service: ClusterIP (default).
+                                     # Доступен ТОЛЬКО внутри кластера.
+                                     # Это правильно: БД не должна быть видна снаружи!
+                                     # Только сервисы внутри кластера могут к ней подключаться.
+                                     # Альтернативы:
+                                     #   NodePort — открывает на ноде (зачем БД наружу?)
+                                     #   LoadBalancer — облачный LB (то же самое)
+                                     #   ExternalName — CNAME на внешний адрес
+```
+
+---
+
+## 🔗 Полная картина: как данные доходят до диска
+
+```
+   [ booking-service Pod ]
+            │
+            │ JDBC: jdbc:postgresql://postgres:5432/booking_db
+            ▼
+   [ CoreDNS резолвит "postgres" ]
+            │
+            ▼
+   [ Service postgres (ClusterIP 10.43.x.x) ]
+            │
+            │ kube-proxy iptables/IPVS правило
+            ▼
+   [ Pod postgres-xxx-yyy на k3s-master ]
+            │
+            │ процесс PostgreSQL слушает 0.0.0.0:5432
+            ▼
+   [ PostgreSQL пишет файлы в /var/lib/postgresql/data/pgdata/ ]
+            │
+            │ volumeMount: postgres-storage → /var/lib/postgresql/data
+            ▼
+   [ PVC postgres-pvc (статус Bound) ]
+            │
+            │ связан с PV
+            ▼
+   [ PV postgres-pv (hostPath, nodeAffinity: k3s-master) ]
+            │
+            │ kubelet монтирует bind mount
+            ▼
+   [ Файловая система ноды k3s-master ]
+   [ /var/lib/postgres-pv/pgdata/ ]
+            │
+            ├── base/         ← таблицы
+            ├── pg_wal/       ← WAL-логи
+            ├── pg_xact/      ← статусы транзакций
+            ├── pg_hba.conf
+            ├── postgresql.conf
+            └── PG_VERSION
+```
+
+---
+
+## ⚠️ Ключевые "подводные камни", которые тут учтены
+
+```
+1. replicas: 1
+   └─ Без этого: повреждение данных при двух writer'ах в одном PVC.
+
+2. strategy: Recreate
+   └─ Без этого: RollingUpdate подняла бы 2 пода одновременно,
+      второй не смог бы прицепить PVC (RWO) → застрял бы в Pending.
+
+3. nodeSelector: k3s-master
+   └─ Без этого: под мог бы попасть на worker и оказаться
+      в пустом /var/lib/postgres-pv → инициализация новой БД.
+
+4. imagePullPolicy: Never
+   └─ Без этого: k3s попытался бы скачать src-postgres из Docker Hub,
+      получил бы 404, под застрял бы в ImagePullBackOff.
+
+5. PGDATA: .../pgdata (с подкаталогом!)
+   └─ Без этого: PostgreSQL ругается, что /var/lib/postgresql/data
+      не пустой (там lost+found от файловой системы).
+
+6. valueFrom Secret (а не plain value)
+   └─ Без этого: пароли торчали бы в Deployment'е plain text
+      → kubectl describe deploy показывал бы их.
+
+7. Service type: ClusterIP (не NodePort)
+   └─ БД не должна быть доступна снаружи. Только внутрикластерные
+      сервисы.
+
+8. PVC, а не emptyDir
+   └─ Без PVC данные исчезали бы при каждом перезапуске пода.
+      Для БД недопустимо.
+```
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> Deployment PostgreSQL запускает строго одну реплику с стратегией Recreate — это критично для БД с RWO-томом. Под прибит к ноде k3s-master через nodeSelector, чтобы попасть туда же, где hostPath PV. Образ src-postgres локальный, imagePullPolicy: Never. Пароли инжектятся из Secret, данные хранятся в PVC. Service ClusterIP даёт внутреннее DNS-имя "postgres".
+
+*(длина ~370 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Почему Deployment, а не StatefulSet для БД?**
+> Хороший вопрос! StatefulSet — "правильный" выбор для stateful-приложений (БД, очереди). Его преимущества:
+> - Стабильные имена подов (`postgres-0`, `postgres-1`), а не случайные.
+> - Стабильное DNS-имя для каждой реплики.
+> - VolumeClaimTemplate — автоматическое создание PVC на каждую реплику.
+> - Упорядоченный rollout (сначала -0, потом -1).
+> 
+> Я использовал Deployment, потому что:
+> 1. У меня одна реплика — преимущества StatefulSet не нужны.
+> 2. Deployment проще, меньше boilerplate.
+> 3. Задание не требует StatefulSet.
+> 
+> Для production-кластера с репликацией PostgreSQL — StatefulSet обязателен.
+
+**В2: Почему `replicas: 1`, а не больше для отказоустойчивости?**
+> PostgreSQL — это "один writer, много readers". Несколько подов с одним PVC (RWO) — невозможно технически. Даже если бы PVC был RWX (а сетевая ФС поддерживает) — PostgreSQL не позволит двум процессам открыть БД одновременно, это приведёт к повреждению.
+> Для масштабирования PostgreSQL нужны:
+> - **Streaming Replication** — master + read replicas (отдельные поды с отдельными PVC).
+> - **Patroni / Stolon** — автоматический failover.
+> - **Citus** — горизонтальное шардирование.
+> 
+> Это уровень другого проекта.
+
+**В3: Что произойдёт, если поменять `strategy: Recreate` на `RollingUpdate`?**
+> Поломается deploy. При rolling update k8s сначала создаёт новый под, потом убивает старый. Но у нас:
+> - PVC = RWO (один writer).
+> - Старый под держит PVC.
+> - Новый под пытается прицепить тот же PVC → застревает в `ContainerCreating` со статусом "Multi-Attach error for volume".
+> 
+> `Recreate` гарантирует: сначала убить → потом создать. Будет downtime ~10 секунд, но это нормально для БД.
+
+**В4: Зачем `imagePullPolicy: Never`? В чём отличие от Always и IfNotPresent?**
+> `Never` = "никогда не тянуть из registry, только локальный образ". Нужно, когда:
+> - Образ собран локально (`docker build`) и НЕ запушен в registry.
+> - Образ импортирован в containerd ноды через `k3s ctr images import`.
+> 
+> Другие политики:
+> - **Always** — тянуть всегда (default для `:latest`). Без registry получим ImagePullBackOff.
+> - **IfNotPresent** — тянуть, если локально нет (default для версий типа `:v1`). Тоже может попытаться скачать.
+> 
+> В моём случае образ `src-postgres:latest` собран локально → только `Never`.
+
+**В5: Что такое `PGDATA` и зачем подкаталог `/pgdata`?**
+> `PGDATA` — переменная окружения, говорящая PostgreSQL, где хранить данные. По умолчанию — `/var/lib/postgresql/data`.
+> Проблема: при монтировании пустого тома (особенно ext4) в нём появляется директория `lost+found`. PostgreSQL при инициализации проверяет, что директория **полностью пустая**. Видит `lost+found` → отказывается стартовать с ошибкой `directory is not empty`.
+> Решение: указываем `PGDATA` = подкаталог `/pgdata`. Тогда PostgreSQL создаст свою папку внутри, и `lost+found` ему не помешает. Это стандартная практика для PostgreSQL в k8s.
+
+**В6: Что произойдёт, если убрать `nodeSelector`?**
+> Под может попасть на любую ноду (master, worker1, worker2). Но PV — это hostPath на k3s-master, привязан через nodeAffinity. Scheduler видит nodeAffinity PV и поставит под на правильную ноду автоматически.
+> Так что технически `nodeSelector` дублирует функцию nodeAffinity PV. Я указал явно для:
+> 1. Документирующей цели — сразу видно, где будет жить под.
+> 2. Защиты от ситуации, если PV пересоздадут с другой nodeAffinity.
+
+**В7: Безопасно ли передавать пароль через env-переменные?**
+> Не идеально, но допустимо для лабораторной. Минусы env:
+> - Видны в `kubectl describe pod` (значения подставлены).
+> - Передаются дочерним процессам.
+> - Могут попасть в логи при крашах (core dump).
+> 
+> Альтернативы:
+> 1. **Volume mount Secret** — пароль читается из файла, не виден в env.
+> 2. **External secret manager** — Vault, AWS Secrets Manager.
+> 3. **CSI Secrets Store** — динамическая загрузка из vault'а.
+
+**В8: Что произойдёт при удалении пода `kubectl delete pod postgres-xxx`?**
+> Deployment автоматически создаст новый под (replicas: 1 надо поддерживать). Новый под:
+> 1. Запланируется на k3s-master (по nodeSelector).
+> 2. Смонтирует тот же PVC postgres-pvc.
+> 3. PostgreSQL найдёт существующие данные в `/var/lib/postgresql/data/pgdata`.
+> 4. Не будет переинициализировать БД — увидит `PG_VERSION` файл и поднимется с существующими данными.
+> 
+> Downtime ~5-15 секунд. Данные сохранятся полностью.
+
+**В9: Что будет с данными при удалении Deployment?**
+> Deployment удалится, под удалится, **PVC останется!** Это специально: PVC и Deployment — независимые ресурсы.
+> Так что:
+> 1. `kubectl delete deploy postgres` → под удалён, PVC жив.
+> 2. Можно создать Deployment снова — он подцепит существующий PVC и данные на месте.
+> 3. Чтобы реально стереть данные → `kubectl delete pvc postgres-pvc` (но PV в Retain останется!).
+> 4. Окончательно: удалить PV или зайти на ноду и `rm -rf /var/lib/postgres-pv`.
+
+**В10: Почему Service `ClusterIP`, а не NodePort?**
+> Базе данных нечего делать в публичной сети. Если открыть PostgreSQL наружу (NodePort) — это огромная дыра безопасности: bot'ы будут брутфорсить пароль каждую секунду. ClusterIP = доступ только из кластера, что и нужно: к БД ходят только микросервисы, и они все в кластере.
+> Если нужен внешний доступ для админа — лучше через `kubectl port-forward` (временный туннель) или bastion-под.
+
+**В11: Что если на ноде уже занят 5432 (например, PostgreSQL уже стоит)?**
+> Конфликта НЕТ! 5432 — это порт ВНУТРИ пода (его сетевого namespace). У пода свой сетевой стек, изолированный от хоста. На хосте 5432 может быть занят чем угодно — пода это не касается.
+> Конфликт возник бы только при NodePort или hostNetwork=true. У нас ClusterIP — внешний порт не открывается.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀

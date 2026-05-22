@@ -21,3 +21,243 @@ data:
   LOYALTY_SERVICE_PORT: "8085"
   REPORT_SERVICE_HOST: report-service
   REPORT_SERVICE_PORT: "8086"
+
+
+
+
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор ConfigMap для микросервисов
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# ConfigMap = "словарь конфигурации", доступный подам кластера.
+# Хранит НЕ-секретные настройки (адреса, порты, имена очередей).
+# Главная идея: настройки отдельно от кода. При смене окружения
+# (dev/stage/prod) меняем ConfigMap, а образы остаются те же.
+# Для секретных данных (пароли, токены) — отдельный объект Secret.
+# ============================================================
+apiVersion: v1                       # Базовая API-группа (core), версия v1.
+                                     # ConfigMap — один из самых старых типов в k8s,
+                                     # живёт в core API с самого начала.
+kind: ConfigMap                      # Тип ресурса: набор ключ-значение для конфигурации.
+metadata:
+  name: app-config                   # Имя ConfigMap. По нему ссылаются Deployment'ы.
+                                     # kubectl get configmap app-config
+                                     # kubectl describe configmap app-config
+                                     # ⚠️ namespace не указан → попадёт в "default".
+                                     # Если приложение в другом namespace —
+                                     # ConfigMap должен быть в том же namespace
+                                     # (или придётся копировать/синхронизировать).
+data:                                # Сами ключ-значение пары.
+                                     # ВСЕ значения должны быть СТРОКАМИ.
+                                     # Числа и булевы значения обязательно в кавычках!
+                                     # Иначе YAML парсер превратит их в int/bool и k8s
+                                     # выдаст ошибку валидации.
+
+  # ----- PostgreSQL -----
+  POSTGRES_HOST: postgres            # DNS-имя Service'а PostgreSQL внутри кластера.
+                                     # "postgres" резолвится в Service postgres того же namespace.
+                                     # Полное имя: postgres.default.svc.cluster.local
+  POSTGRES_PORT: "5432"              # Порт PostgreSQL. В кавычках — это СТРОКА.
+                                     # Если написать 5432 без кавычек, YAML распарсит как int
+                                     # → k8s выдаст ошибку: "expected string, got integer".
+
+  # ----- RabbitMQ (брокер сообщений) -----
+  RABBIT_MQ_HOST: rabbitmq           # DNS-имя Service'а RabbitMQ.
+                                     # Сервисы общаются через брокер для асинхронных событий.
+  RABBIT_MQ_PORT: "5672"             # Стандартный порт AMQP (Advanced Message Queuing Protocol).
+                                     # Это "родной" протокол RabbitMQ.
+                                     # Отдельно есть 15672 — для web UI Management.
+  RABBIT_MQ_QUEUE_NAME: booking_statistics_queue
+                                     # Имя очереди, куда booking-service кладёт события
+                                     # о новых бронированиях, а report-service их читает.
+  RABBIT_MQ_EXCHANGE: booking_statistics_exchange
+                                     # Имя exchange (точки обмена).
+                                     # В RabbitMQ producer пишет в exchange, exchange по правилам
+                                     # routing маршрутизирует в очереди.
+                                     # Concept: producer → exchange → queue(s) → consumer
+
+  # ----- Адреса микросервисов внутри кластера -----
+  # Каждый сервис = пара HOST + PORT.
+  # HOST = имя k8s Service'а (kube-dns его резолвит автоматически).
+  # PORT = порт, на котором Service слушает (порт Spring Boot приложения).
+
+  SESSION_SERVICE_HOST: session-service   # Авторизация/Аутентификация пользователей.
+  SESSION_SERVICE_PORT: "8081"            # Согласовано с Postman: USERS_PORT=8081.
+
+  HOTEL_SERVICE_HOST: hotel-service       # Управление отелями, поиск, выдача данных.
+  HOTEL_SERVICE_PORT: "8082"
+
+  BOOKING_SERVICE_HOST: booking-service   # Бронирование номеров. Ядро бизнес-логики.
+  BOOKING_SERVICE_PORT: "8083"            # Шлёт события в RabbitMQ при создании брони.
+
+  PAYMENT_SERVICE_HOST: payment-service   # Оплата броней.
+  PAYMENT_SERVICE_PORT: "8084"
+
+  LOYALTY_SERVICE_HOST: loyalty-service   # Программа лояльности (баланс баллов).
+  LOYALTY_SERVICE_PORT: "8085"
+
+  REPORT_SERVICE_HOST: report-service     # Сбор статистики, читает из RabbitMQ.
+  REPORT_SERVICE_PORT: "8086"             # Подписчик на booking_statistics_queue.
+                                          # GATEWAY (8087) намеренно НЕ упомянут здесь —
+                                          # это входная точка, его адрес не нужен другим сервисам.
+```
+
+---
+
+## 🔗 Как ConfigMap "доезжает" до приложения
+
+ConfigMap сам по себе ничего не делает — это просто словарь. Чтобы его данные попали в приложение, Deployment микросервиса должен на него сослаться. Есть два способа:
+
+### Способ 1: каждое значение → отдельная env-переменная
+
+```yaml
+# В Deployment'е любого сервиса:
+env:
+  - name: POSTGRES_HOST
+    valueFrom:
+      configMapKeyRef:
+        name: app-config             # ← имя нашего ConfigMap
+        key: POSTGRES_HOST           # ← конкретный ключ
+  - name: POSTGRES_PORT
+    valueFrom:
+      configMapKeyRef:
+        name: app-config
+        key: POSTGRES_PORT
+  # ... и т.д. для каждой переменной
+```
+
+### Способ 2: импорт ВСЕХ значений одним блоком (короче и удобнее)
+
+```yaml
+# В Deployment'е любого сервиса:
+envFrom:
+  - configMapRef:
+      name: app-config               # ← все ключи станут env-переменными автоматически
+```
+
+Затем Spring Boot читает их через `@Value("${POSTGRES_HOST}")` или через `application.yml`:
+```yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/booking_db
+```
+
+---
+
+## 🌐 Карта взаимодействий сервисов
+
+```
+                    [ Postman / Browser ]
+                            │
+                            │ HTTPS
+                            ▼
+                  [ Ingress-Nginx ]
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+     [ session-service ]         [ gateway-service ]
+         :8081 (auth)                :8087 (API)
+                                         │
+              ┌───────────────────────────┼────────────────────────┐
+              ▼                           ▼                        ▼
+     [ hotel-service ]         [ booking-service ]        [ loyalty-service ]
+         :8082                       :8083                       :8085
+                                         │                        ▲
+                                         │ публикует              │
+                                         ▼ событие                │
+                              ┌────────────────────┐              │
+                              │  RabbitMQ :5672    │              │
+                              │  exchange:         │              │
+                              │  booking_stat_exch │              │
+                              │       │            │              │
+                              │       ▼            │              │
+                              │  queue:            │              │
+                              │  booking_stat_q    │              │
+                              └─────────┬──────────┘              │
+                                        │ подписан                │
+                                        ▼                         │
+                              [ report-service ]                  │
+                                  :8086                           │
+                                                                  │
+              ┌─────────────────────────┐                         │
+              ▼                         ▼                         │
+     [ payment-service ]       [ PostgreSQL :5432 ]               │
+         :8084                   (общая БД для всех)              │
+              ▲                                                   │
+              │                                                   │
+              └───────────────────── взаимодействие ──────────────┘
+                          (платёж → начисление баллов лояльности)
+```
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> ConfigMap app-config выносит всю несекретную конфигурацию микросервисов в один объект: адреса PostgreSQL, RabbitMQ и шести Spring Boot сервисов. Сервисы видят друг друга по DNS-именам Service'ов: postgres, rabbitmq, hotel-service и т.д. При смене окружения я меняю только ConfigMap, не пересобирая образы.
+
+*(длина ~320 символов, могу подрезать до ровно 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Почему именно ConfigMap, а не Secret? Где грань?**
+> ConfigMap — для **несекретных** данных: адреса, порты, имена очередей, флаги. Secret — для **чувствительных**: пароли БД, API-ключи, JWT-секреты. Технически Secret тоже хранит ключ-значение, но в base64 и с RBAC-ограничениями. Логин postgres = ConfigMap, пароль postgres = Secret. У меня в проекте они разделены: app-config (адреса) и app-secrets (пароли).
+
+**В2: Почему порты в кавычках, а хосты — нет?**
+> Все значения в `data` ConfigMap должны быть **строками**. Хосты типа `postgres` YAML парсит как строку автоматически. А число `5432` без кавычек YAML интерпретирует как `int`, и k8s валидация выдаст ошибку: "expected string". Кавычки явно говорят YAML-парсеру: "это строка". Альтернатива — использовать `binaryData` (но это уже для бинарников).
+
+**В3: Что произойдёт, если изменить ConfigMap, пока приложение запущено?**
+> Зависит от способа подключения:
+> 1. **env-переменные** (наш случай) — k8s НЕ перезапускает поды при изменении ConfigMap, переменные читаются один раз при старте. Нужно ручное `kubectl rollout restart deploy/<name>`.
+> 2. **Через volume mount** (конфиг как файл) — k8s обновляет содержимое файла в поде через ~60 секунд автоматически. Но приложение должно само следить за изменением файла.
+> 
+> В моём случае все Spring Boot сервисы читают env-переменные → требуется restart после изменения.
+
+**В4: Зачем нужны DNS-имена сервисов? Почему не использовать IP?**
+> IP-адреса подов и Service'ов могут меняться (под перезапустился — новый IP). А DNS-имя Service'а **стабильно**, оно живёт пока существует сам Service. Kubernetes имеет встроенный CoreDNS, который автоматически резолвит:
+> - `postgres` → ClusterIP Service'а postgres
+> - `postgres.default` → то же самое
+> - `postgres.default.svc.cluster.local` → полное FQDN
+> 
+> Это **service discovery** на уровне платформы, бесплатно.
+
+**В5: Почему gateway-service нет в этом ConfigMap?**
+> Сервисы общаются друг с другом **внутри** кластера — им не нужен gateway. Gateway — это **внешняя** точка входа, через него приходят клиенты (Postman, браузер). Внутри кластера booking-service напрямую идёт в hotel-service, минуя gateway. Если добавить GATEWAY_HOST сюда — это просто не используется. Но никто не запрещает добавить для единообразия.
+
+**В6: Что такое exchange и queue в RabbitMQ — зачем разделять?**
+> Это принцип publish-subscribe:
+> - **Exchange** (точка обмена) — место, куда producer (booking-service) кладёт сообщение. Он НЕ знает, кто и сколько подписчиков.
+> - **Queue** (очередь) — буфер, откуда consumer (report-service) читает сообщения.
+> - **Binding** — правило: "сообщения из этого exchange кладутся в эту queue".
+> 
+> Разделение позволяет:
+> - Одним exchange кормить несколько queue (fan-out).
+> - Маршрутизировать по ключу (topic, routing key).
+> - Менять подписчиков без изменения producer'а.
+
+**В7: Можно ли иметь два ConfigMap с одинаковыми ключами?**
+> Можно, но при `envFrom` k8s объединит их в одну переменную окружения. Если значения разные — k8s применит **последний** из envFrom-списка. Лучше так не делать — путаница. Для разделения логично использовать разные имена ключей или префиксы (`AUTH_DB_HOST`, `MAIN_DB_HOST`).
+
+**В8: А если поменять `POSTGRES_HOST` на `postgres-primary` — что сломается?**
+> Сервисы перестанут находить базу: они будут резолвить `postgres-primary`, но Service такого имени нет → DNS NXDOMAIN → connection refused. Чтобы это работало, надо одновременно переименовать Service в `postgres-primary`. ConfigMap — это лишь "указатель", сам по себе он ничего не создаёт.
+
+**В9: Видны ли значения ConfigMap всем подам в кластере?**
+> Только тем, кто:
+> 1. Живёт в том же namespace, что и ConfigMap.
+> 2. Имеет RBAC-разрешение на чтение (по умолчанию у `default` ServiceAccount разрешено).
+> 3. Явно ссылается на ConfigMap через `envFrom`/`env`/`volumes`.
+> 
+> Сам ConfigMap не "проталкивается" во все поды автоматически — нужно явное подключение в Deployment'е.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀

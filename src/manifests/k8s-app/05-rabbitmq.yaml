@@ -39,3 +39,333 @@ spec:
       port: 15672
       targetPort: 15672
   type: ClusterIP
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор Deployment + Service для RabbitMQ
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment RabbitMQ
+# Запускает один под брокера сообщений RabbitMQ.
+# RabbitMQ — это посредник между сервисами:
+#   booking-service → RabbitMQ → report-service
+# Используется для асинхронного обмена событиями.
+# Образ alpine + management = с веб-интерфейсом для админки.
+# ============================================================
+apiVersion: apps/v1                  # API-группа apps, версия v1 (стабильная).
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: rabbitmq                     # Имя Deployment'а.
+                                     # Совпадает с именем Service ниже — стандартная практика.
+  labels: { app: rabbitmq }          # Метка на самом Deployment (inline-синтаксис YAML).
+                                     # Эквивалент:
+                                     #   labels:
+                                     #     app: rabbitmq
+                                     # Используется для kubectl-фильтрации:
+                                     #   kubectl get deploy -l app=rabbitmq
+spec:
+  replicas: 1                        # Одна реплика.
+                                     # RabbitMQ умеет в кластеризацию (несколько узлов),
+                                     # но это сложная настройка с peer discovery, erlang cookie,
+                                     # quorum queues. Для лабы достаточно одной.
+                                     # ⚠️ Без cluster нет high availability: упал под →
+                                     # очереди недоступны до перезапуска.
+  selector:
+    matchLabels: { app: rabbitmq }   # Селектор подов: какие поды "усыновлять".
+  template:                          # ШАБЛОН пода.
+    metadata:
+      labels: { app: rabbitmq }      # Метка на поде. Совпадает с селектором (обязательно!).
+    spec:
+      containers:
+        - name: rabbitmq             # Имя контейнера в поде.
+          image: rabbitmq:3.12-management-alpine
+                                     # Официальный образ RabbitMQ с Docker Hub.
+                                     # Разбор тега:
+                                     #   3.12        — версия RabbitMQ
+                                     #   management  — включён плагин управления (Web UI + API)
+                                     #   alpine      — лёгкий базовый образ (~50 МБ вместо ~200)
+                                     # Без management суффикса доступ только через CLI/AMQP.
+          imagePullPolicy: Never     # Использовать ТОЛЬКО локальный образ.
+                                     # ⚠️ Тут это спорно: rabbitmq:3.12-management-alpine —
+                                     # ПУБЛИЧНЫЙ образ из Docker Hub, его можно качать!
+                                     # Корректнее IfNotPresent или Always.
+                                     # Видимо, образ заранее импортирован в containerd ноды:
+                                     #   k3s ctr images import rabbitmq.tar
+                                     # При первом запуске с Never и без локального образа
+                                     # под упадёт в ErrImageNeverPull.
+          ports:
+            - containerPort: 5672    # AMQP-порт — стандартный протокол RabbitMQ.
+                                     # На этот порт коннектятся приложения (booking-service,
+                                     # report-service) для отправки/получения сообщений.
+            - containerPort: 15672   # Management UI — веб-интерфейс админки.
+                                     # http://rabbitmq:15672 (внутри кластера)
+                                     # Логин/пароль = те же, что DEFAULT_USER/PASS.
+                                     # Удобно: можно смотреть очереди, exchange, метрики.
+          env:                       # Переменные окружения для конфигурации RabbitMQ.
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: RABBIT_MQ_USER }
+                                     # Имя пользователя по умолчанию.
+                                     # Образ RabbitMQ читает эту env при ПЕРВОМ старте и
+                                     # создаёт пользователя с этим именем.
+                                     # У нас = "guest" (из Secret).
+                                     # ⚠️ Без этой переменной создастся юзер guest по умолчанию,
+                                     # но он работает ТОЛЬКО с localhost (loopback_users).
+                                     # Когда мы явно создаём его через RABBITMQ_DEFAULT_USER,
+                                     # этого ограничения нет.
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: RABBIT_MQ_PASSWORD }
+                                     # Пароль пользователя по умолчанию.
+                                     # У нас = "guest" (из Secret).
+                                     # При первом старте сохранится в Mnesia (внутренняя БД
+                                     # RabbitMQ), при последующих стартах env игнорируется.
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для RabbitMQ
+# Открывает два порта: AMQP (для приложений) и Management (для UI).
+# ClusterIP — доступ только изнутри кластера.
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Сервис = балансировщик + DNS-имя.
+metadata:
+  name: rabbitmq                     # КЛЮЧЕВОЕ! По этому имени сервисы коннектятся:
+                                     #   ConfigMap: RABBIT_MQ_HOST: rabbitmq
+                                     #   Spring: spring.rabbitmq.host=rabbitmq
+                                     # CoreDNS резолвит "rabbitmq" → ClusterIP этого Service.
+  labels: { app: rabbitmq }          # Метка на Service.
+spec:
+  selector: { app: rabbitmq }        # Трафик пойдёт в поды с этим лейблом.
+  ports:                             # Несколько портов — поэтому каждый должен иметь name!
+                                     # Если порт один — name необязателен.
+    - name: amqp                     # Имя порта. Используется в EndpointSlice и в ссылках.
+                                     # Например, в Ingress можно ссылаться:
+                                     #   port: { name: amqp }
+      port: 5672                     # Порт самого Service'а.
+      targetPort: 5672               # Порт в поде, куда форвардить трафик.
+    - name: management               # Второй порт — Management UI.
+      port: 15672
+      targetPort: 15672
+                                     # Итого: на одном Service висят 2 порта.
+                                     # Из кластера:
+                                     #   tcp://rabbitmq:5672      → AMQP
+                                     #   http://rabbitmq:15672    → Web UI
+  type: ClusterIP                    # Тип ClusterIP — только изнутри кластера.
+                                     # Брокер сообщений НЕ должен светиться наружу:
+                                     # это инфраструктура, к ней ходят только сервисы.
+                                     # Для просмотра Web UI с локального компа можно использовать:
+                                     #   kubectl port-forward svc/rabbitmq 15672:15672
+                                     # И открыть http://localhost:15672
+```
+
+---
+
+## 🔗 Как RabbitMQ участвует в обмене сообщениями
+
+```
+   [ booking-service ]
+            │
+            │ 1. Создана бронь, надо уведомить report-service
+            │    "publish" event в exchange "booking_statistics_exchange"
+            ▼
+   [ AMQP-клиент Spring Boot ] ────tcp:5672────▶ [ rabbitmq:5672 (Service) ]
+                                                            │
+                                                            ▼
+                                              [ Pod rabbitmq-xxx-yyy ]
+                                                            │
+                                                            │ внутри RabbitMQ:
+                                                            ▼
+                                              ┌───────────────────────────┐
+                                              │  Exchange:                │
+                                              │  booking_statistics_exch  │
+                                              │  type: direct/topic       │
+                                              └────────────┬──────────────┘
+                                                           │ routing по правилу binding
+                                                           ▼
+                                              ┌───────────────────────────┐
+                                              │  Queue:                   │
+                                              │  booking_statistics_queue │
+                                              │  - сообщение #1           │
+                                              │  - сообщение #2           │
+                                              │  - сообщение #3           │
+                                              └────────────┬──────────────┘
+                                                           │ подписчик читает
+                                                           ▼
+                                              [ report-service подписан ]
+                                              [ Spring AMQP Listener     ]
+                                                           │
+                                                           ▼
+                                              [ Обработка статистики,    ]
+                                              [ запись в БД и т.д.       ]
+
+
+Параллельно, для админа:
+   [ kubectl port-forward svc/rabbitmq 15672:15672 ]
+            │
+            ▼
+   [ http://localhost:15672 в браузере ]
+            │
+            ▼
+   [ Web UI RabbitMQ ]
+   - Просмотр очередей, exchange
+   - Создание/удаление вручную
+   - Метрики, скорость потока сообщений
+   - Управление пользователями
+```
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> RabbitMQ — брокер сообщений между booking-service и report-service. Deployment с одной репликой образа rabbitmq:3.12-management-alpine. Креды берутся из Secret через RABBITMQ_DEFAULT_USER/PASS. Service ClusterIP открывает два порта: 5672 для AMQP-трафика приложений и 15672 для Web UI администрирования. Имя сервиса rabbitmq резолвится через CoreDNS.
+
+*(длина ~350 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Что такое RabbitMQ и зачем он нужен в этой архитектуре?**
+> RabbitMQ — это **message broker** (брокер сообщений). Он реализует асинхронный обмен между микросервисами по принципу publish-subscribe:
+> - Producer (booking-service) кладёт сообщение в очередь и **сразу свободен** — не ждёт ответа.
+> - Consumer (report-service) читает сообщение **когда сможет** — может тормозить, перезапускаться.
+> 
+> Преимущества:
+> - **Развязка** сервисов: booking ничего не знает о report.
+> - **Буферизация**: пиковая нагрузка не валит подписчиков.
+> - **Гарантированная доставка**: сообщения хранятся до подтверждения.
+> - **Масштабирование**: несколько consumer'ов читают одну очередь.
+
+**В2: Почему `imagePullPolicy: Never` для официального образа? Это правильно?**
+> Хороший вопрос. Технически — это **избыточно**. `rabbitmq:3.12-management-alpine` — публичный образ на Docker Hub, его можно скачать. Корректнее было бы `IfNotPresent` или вообще ничего не указывать (default).
+> 
+> `Never` работает, только если образ заранее импортирован в containerd ноды:
+> ```bash
+> docker pull rabbitmq:3.12-management-alpine
+> docker save rabbitmq:3.12-management-alpine -o rabbitmq.tar
+> sudo k3s ctr images import rabbitmq.tar
+> ```
+> 
+> Видимо, это сделали при подготовке среды, чтобы не зависеть от интернета. На защите можно объяснить так: "унифицировал политику со всеми сервисами, чтобы кластер работал офлайн".
+
+**В3: Что произойдёт, если поменять пароль через переменные после первого запуска?**
+> Ничего! RabbitMQ читает `RABBITMQ_DEFAULT_USER/PASS` **только при первом запуске**, когда инициализируется Mnesia (внутренняя БД). При последующих стартах эти env игнорируются.
+> 
+> Для смены пароля нужно:
+> 1. Зайти в Web UI или через `rabbitmqctl change_password`.
+> 2. Или удалить data-volume и пересоздать под (потеря очередей!).
+> 
+> ⚠️ У нас данные RabbitMQ НЕ персистентны (нет PVC) — при перезапуске пода всё стирается, и юзер пересоздаётся с new значениями env.
+
+**В4: Где хранятся очереди RabbitMQ — на диске или в памяти?**
+> По умолчанию RabbitMQ хранит данные (очереди, exchange, user'ы, метаданные) в **Mnesia** — встроенной БД Erlang. Путь: `/var/lib/rabbitmq/mnesia/`.
+> 
+> ⚠️ У нас НЕТ PVC для RabbitMQ! Это значит:
+> - При перезапуске пода **все очереди исчезают**.
+> - Все непрочитанные сообщения теряются.
+> 
+> Для production обязательно нужен PVC, как для PostgreSQL. Для лабы можно жить без — после restart'а сервисы создадут exchange/queue заново автоматически.
+
+**В5: Зачем плагин `management`? Можно ли без него?**
+> Можно. `management` — это **необязательный** плагин с двумя функциями:
+> 1. **Web UI** на порту 15672 — графический интерфейс.
+> 2. **HTTP API** — REST для управления (queue, user, и т.д.).
+> 
+> Без него RabbitMQ работает только через AMQP-протокол и `rabbitmqctl` (CLI). Образ без management суффикса легче, но в debug'е сильно сложнее. Для разработки management почти всегда удобен.
+
+**В6: Почему у Service два порта и зачем им имена?**
+> Если на Service несколько портов — каждый **обязан** иметь поле `name`. Без имени k8s выдаст ошибку валидации: "must specify name in multi-port service".
+> 
+> Зачем имена:
+> - **Уникальность**: внутри одного Service два порта должны различаться по name.
+> - **Ссылки**: в Ingress / Pod readiness можно ссылаться по имени, а не цифре:
+>   ```yaml
+>   port: { name: amqp }
+>   ```
+> - **Документация**: сразу понятно, какой порт для чего.
+
+**В7: Что такое exchange, queue, binding, routing key?**
+> Это базовая модель AMQP:
+> - **Exchange** — точка входа. Producer публикует сообщение **сюда**.
+> - **Queue** — очередь. Consumer читает **отсюда**.
+> - **Binding** — правило: "сообщения из этого exchange попадают в эту queue, если выполнено условие".
+> - **Routing key** — метка сообщения, по которой binding принимает решение.
+> 
+> Типы exchange:
+> - **direct** — сообщение в queue, если routing key == binding key.
+> - **fanout** — рассылка во все привязанные queue.
+> - **topic** — pattern matching по routing key (`order.*.created`).
+> - **headers** — по заголовкам сообщения.
+
+**В8: Как несколько consumer'ов работают с одной очередью?**
+> RabbitMQ балансирует сообщения между всеми подписчиками очереди по round-robin (если используется `prefetch=1` или работа в режиме fair-dispatch). Это **competing consumers** — паттерн масштабирования.
+> 
+> Если у нас 3 пода report-service, подписанные на одну очередь:
+> - Сообщение #1 → report-service-1
+> - Сообщение #2 → report-service-2
+> - Сообщение #3 → report-service-3
+> 
+> Это позволяет горизонтально масштабировать обработку.
+
+**В9: Что произойдёт, если booking опубликует сообщение, а consumer'а нет?**
+> Сообщение **сохранится в очереди** (если очередь durable + сообщение persistent). Когда consumer появится — он его прочитает.
+> 
+> Без правильных флагов:
+> - Если queue не durable — пропадёт при перезапуске RabbitMQ.
+> - Если message не persistent — пропадёт при перезапуске RabbitMQ.
+> - Если queue auto-delete — удалится после отключения последнего consumer'а.
+> 
+> Spring AMQP по умолчанию создаёт durable queue + persistent message.
+
+**В10: Как посмотреть Web UI RabbitMQ из браузера?**
+> Из-за ClusterIP — извне напрямую не получится. Варианты:
+> 
+> 1. **kubectl port-forward** (самый простой):
+> ```bash
+> kubectl port-forward svc/rabbitmq 15672:15672
+> # → открыть http://localhost:15672
+> ```
+> 
+> 2. **Через Ingress** (постоянный доступ):
+> ```yaml
+> spec:
+>   rules:
+>   - host: rabbitmq.10.174.8.95.nip.io
+>     http:
+>       paths:
+>       - path: /
+>         backend:
+>           service:
+>             name: rabbitmq
+>             port: { name: management }
+> ```
+> 
+> 3. **NodePort** (быстро, но не безопасно).
+
+**В11: Почему replicas: 1, можно ли больше?**
+> Можно, но нужна **кластеризация RabbitMQ** — это не просто увеличение replicas. Шаги:
+> 1. StatefulSet вместо Deployment (стабильные имена rabbitmq-0, rabbitmq-1).
+> 2. Erlang cookie должен совпадать на всех узлах (через Secret).
+> 3. Peer discovery (через k8s API или DNS).
+> 4. Queue type = quorum или mirrored для репликации между узлами.
+> 5. Headless Service для DNS подов.
+> 
+> Это полноценный кластер с HA. Готовый чарт: `bitnami/rabbitmq`. Для нашей лабы достаточно одной реплики.
+
+**В12: Различие между Mnesia и Quorum queues?**
+> - **Classic queues (Mnesia)** — старая модель, хранение в Mnesia. Простые, но при HA-репликации проблемы (mirror queues deprecated в 3.13).
+> - **Quorum queues** — новая модель на базе Raft consensus. Лучше для HA, гарантия доставки, отказоустойчивость. Доступны с RabbitMQ 3.8+.
+> 
+> Для нашей задачи (один узел, простые события) — classic queues по умолчанию вполне ОК.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀

@@ -50,3 +50,562 @@ spec:
     - port: 8087
       targetPort: 8087
   type: ClusterIP
+
+
+
+
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор Deployment + Service для gateway-service
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment gateway-service
+# Микросервис — единая точка входа в систему (API Gateway).
+# Это "лицо" приложения для внешнего мира.
+#
+# Ключевые функции:
+#  1. Принимает HTTP-запросы извне через Ingress.
+#  2. Аутентифицирует пользователей (валидирует JWT-токены).
+#  3. Маршрутизирует запросы на нужный внутренний сервис.
+#  4. Может агрегировать данные от нескольких сервисов.
+#  5. Применяет cross-cutting: rate limit, логирование, CORS.
+#
+# В Postman: ВСЕ запросы (кроме Login User) идут через него:
+#  GET  /api/v1/gateway/hotels         → hotel-service
+#  GET  /api/v1/gateway/hotels/{uid}   → hotel-service
+#  POST /api/v1/gateway/booking        → booking-service
+#  GET  /api/v1/gateway/loyalty        → loyalty-service
+# ============================================================
+apiVersion: apps/v1                  # API-группа apps, версия v1.
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: gateway-service              # Имя Deployment'а.
+  labels: { app: gateway-service }   # Метка на Deployment (inline YAML).
+spec:
+  replicas: 1                        # Одна реплика для лабы.
+                                     # ⚠️ В продакшне gateway-service — самое
+                                     # критичное звено! Минимум 3 реплики:
+                                     # - Все клиенты бьются именно сюда.
+                                     # - Падение = полная недоступность API.
+                                     # - Нагрузка часто пиковая (DDoS-сценарии).
+                                     # + HPA по CPU/RPS, anti-affinity между нодами.
+  selector:
+    matchLabels: { app: gateway-service }
+                                     # Селектор: какие поды Deployment контролирует.
+  template:                          # Шаблон создаваемых подов.
+    metadata:
+      labels: { app: gateway-service }
+                                     # Метка пода — совпадает с селектором.
+    spec:
+      containers:
+        - name: gateway-service      # Имя контейнера в поде.
+          image: src-gateway-service:latest
+                                     # Локальный образ Spring Boot из DO10.
+                                     # Содержит:
+                                     # - Spring Cloud Gateway / Spring MVC.
+                                     # - REST-клиенты (WebClient/RestTemplate) для downstream.
+                                     # - JWT валидатор (или вызов session-service).
+          imagePullPolicy: Never     # Только локальный образ из containerd k3s.
+                                     # Образ заранее импортирован:
+                                     #   k3s ctr images import gateway-service.tar
+          ports:
+            - containerPort: 8087    # Порт Spring Boot.
+                                     # Согласован с Postman (GATEWAY_PORT: "8087").
+                                     # Согласован с ConfigMap (SESSION_SERVICE_PORT и т.д.).
+                                     # ⚠️ Замечу: у gateway нет ключа GATEWAY_SERVICE_PORT
+                                     # в ConfigMap — он самостоятельно знает свой порт,
+                                     # это значение нужно лишь Ingress'у при routing.
+          env:                       # 10 env-переменных — все адреса соседних сервисов.
+                                     # ⚠️ Нет POSTGRES_* и RABBIT_MQ_* — gateway не имеет
+                                     # собственной БД и не использует RabbitMQ!
+                                     # Он stateless-прокси: получил запрос, проверил токен,
+                                     # переслал дальше, вернул ответ.
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-1: Адрес session-service
+            # Для валидации Bearer-токенов из заголовка Authorization.
+            # Когда приходит запрос, gateway проверяет токен:
+            #   GET http://session-service:8081/api/v1/auth/validate
+            # ─────────────────────────────────────────────
+            - name: SESSION_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: SESSION_SERVICE_HOST  # → "session-service"
+            - name: SESSION_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: SESSION_SERVICE_PORT }
+                                     # → "8081"
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-2: Адрес hotel-service
+            # Маршрут: /api/v1/gateway/hotels → /api/v1/hotels
+            # ─────────────────────────────────────────────
+            - name: HOTEL_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: HOTEL_SERVICE_HOST }
+                                     # → "hotel-service"
+            - name: HOTEL_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: HOTEL_SERVICE_PORT }
+                                     # → "8082"
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-3: Адрес booking-service
+            # Маршрут: /api/v1/gateway/booking → /api/v1/bookings
+            # ─────────────────────────────────────────────
+            - name: BOOKING_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: BOOKING_SERVICE_HOST }
+                                     # → "booking-service"
+            - name: BOOKING_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: BOOKING_SERVICE_PORT }
+                                     # → "8083"
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-4: Адрес loyalty-service
+            # Маршрут: /api/v1/gateway/loyalty → /api/v1/loyalty
+            # ─────────────────────────────────────────────
+            - name: LOYALTY_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: LOYALTY_SERVICE_HOST }
+                                     # → "loyalty-service"
+            - name: LOYALTY_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: LOYALTY_SERVICE_PORT }
+                                     # → "8085"
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-5: Адрес report-service
+            # Маршрут: /api/v1/gateway/reports → /api/v1/reports
+            # ⚠️ В Postman-тестах не используется,
+            # но может быть админский эндпоинт для отчётов.
+            # ─────────────────────────────────────────────
+            - name: REPORT_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: REPORT_SERVICE_HOST }
+                                     # → "report-service"
+            - name: REPORT_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: REPORT_SERVICE_PORT }
+                                     # → "8086"
+
+            # ⚠️ Замечу: НЕТ env-переменных для payment-service!
+            # Это правильно: к payment ходит ТОЛЬКО booking-service,
+            # gateway не должен проводить платежи напрямую.
+            # Защита от прямого вызова /api/v1/payments снаружи.
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для gateway-service
+# Порт 8087. ClusterIP — да, ClusterIP, потому что
+# наружу выводится через Ingress (а не через NodePort).
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Балансировщик + DNS-имя.
+metadata:
+  name: gateway-service              # КЛЮЧЕВОЕ! По имени резолвится через CoreDNS.
+                                     # ⚠️ Этот Service — backend для Ingress!
+                                     # В Ingress (см. отдельный манифест):
+                                     #   backend:
+                                     #     service:
+                                     #       name: gateway-service
+                                     #       port:
+                                     #         number: 8087
+  labels: { app: gateway-service }   # Метка на Service'е.
+spec:
+  selector: { app: gateway-service } # Трафик в поды с этим лейблом.
+  ports:
+    - port: 8087                     # Порт Service'а — входящий.
+                                     # Совпадает с Postman GATEWAY_PORT=8087.
+      targetPort: 8087               # Порт пода (= containerPort).
+  type: ClusterIP                    # Только из кластера!
+                                     # ⚠️ Тут типичная путаница студентов:
+                                     # "Если gateway — точка входа, не должен ли он быть
+                                     # NodePort/LoadBalancer?"
+                                     # ОТВЕТ: Нет! Внешний доступ через Ingress.
+                                     # Ingress (Nginx-под) сам внутри кластера,
+                                     # и он проксирует трафик на ClusterIP gateway.
+                                     # Снаружи виден только Ingress-Controller на
+                                     # портах 80/443. gateway — внутренний сервис.
+```
+
+---
+
+## 🔗 Полная картина: как Postman доходит до hotel-service через gateway
+
+```
+   ┌─────────────────────────────────────────────────────┐
+   │ ПОСТМАН: GET /api/v1/gateway/hotels                 │
+   │ Host: gateway.10.174.8.95.nip.io                    │
+   │ Authorization: Bearer eyJhbGc...                    │
+   └────────────────────┬────────────────────────────────┘
+                        │ HTTPS
+                        ▼
+              ┌──────────────────┐
+              │  DNS: nip.io      │ → 10.174.8.95
+              └─────────┬─────────┘
+                        ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  k3s master node, порт 443                          │
+   └────────────────────┬────────────────────────────────┘
+                        │
+                        ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  Ingress-Nginx Controller (Pod в ns ingress-nginx)  │
+   │  - TLS termination (расшифровка HTTPS)              │
+   │  - Lookup правил по Host: gateway.10.174.8.95.nip.io│
+   │  - Backend: gateway-service:8087                    │
+   └────────────────────┬────────────────────────────────┘
+                        │ HTTP (внутри кластера)
+                        ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  Service gateway-service (ClusterIP 10.43.X.Y)      │
+   │  - kube-proxy iptables/IPVS                         │
+   └────────────────────┬────────────────────────────────┘
+                        │
+                        ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  Pod gateway-service-XXX-YYY                        │
+   │                                                      │
+   │  ШАГ 1: Извлекает токен из заголовка Authorization  │
+   │                                                      │
+   │  ШАГ 2: Валидирует токен                            │
+   │   ┌─────────────────────────────────────────┐       │
+   │   │ Вариант A: проверяет JWT самостоятельно │       │
+   │   │ (валидирует подпись)                    │       │
+   │   │                                         │       │
+   │   │ Вариант B: спрашивает session-service:  │       │
+   │   │ GET http://session-service:8081/validate│       │
+   │   │ → 200 OK { userId, roles }              │       │
+   │   └─────────────────────────────────────────┘       │
+   │                                                      │
+   │  ШАГ 3: Маршрутизирует на hotel-service              │
+   │   GET http://hotel-service:8082/api/v1/hotels        │
+   │                                                      │
+   │  ШАГ 4: Получает ответ                               │
+   │   ← 200 OK [ {hotel-1}, {hotel-2}, ... ]            │
+   │                                                      │
+   │  ШАГ 5: (опционально) Трансформация ответа          │
+   │   - Фильтрация полей                                 │
+   │   - Маскирование чувствительных данных              │
+   │                                                      │
+   │  ШАГ 6: Возвращает клиенту                           │
+   │   ← 200 OK [ ... ]                                   │
+   └────────────────────┬────────────────────────────────┘
+                        │
+                        ▼ (тот же путь обратно)
+                  ┌─────────────┐
+                  │  Postman    │ ← 200 OK + JSON
+                  └─────────────┘
+```
+
+---
+
+## 🏛 Архитектурная роль gateway-service
+
+```
+                    [ ИНТЕРНЕТ / Postman / Браузер ]
+                                  │
+                                  ▼
+                       ╔═══════════════════════╗
+                       ║  Ingress-Nginx        ║
+                       ║  (только HTTPS наружу) ║
+                       ╚════════════╤══════════╝
+                                    │
+                ┌───────────────────┴──────────────────┐
+                ▼                                      ▼
+       [ session-service ]                  [ gateway-service ]
+        (login endpoint)                     (всё остальное)
+              :8081                               :8087
+                                                  │
+                                                  │ маршрутизация
+                                                  │ + валидация JWT
+                                                  │
+              ┌────────────┬────────────┬─────────┴─────────┬─────────────┐
+              ▼            ▼            ▼                   ▼             ▼
+        [ session ] [ hotel ]    [ booking ]         [ loyalty ]    [ report ]
+        (validate)   :8082        :8083                :8085         :8086
+                                     │
+                                     │ только booking имеет доступ
+                                     ▼
+                              [ payment ]
+                               :8084
+                                     
+                              [ RabbitMQ ]
+                                     │
+                                     ▼
+                              [ report ]
+                                     │
+                                     ▼
+                              [ statistics_db ]
+```
+
+**Принципы:**
+
+1. **Gateway = единая точка входа** для бизнес-API (всё, что после логина).
+2. **Session = отдельная точка входа** только для логина (получения токена).
+3. **Payment скрыт** даже от gateway — к нему ходит ТОЛЬКО booking.
+4. **Все внутренние сервисы** ClusterIP, не выставлены наружу.
+
+---
+
+## 🆚 Сравнение gateway-service со всеми сервисами
+
+| Свойство | session | hotel | booking | payment | loyalty | report | **gateway** |
+|----------|---------|-------|---------|---------|---------|--------|------------|
+| Порт | 8081 | 8082 | 8083 | 8084 | 8085 | 8086 | **8087** |
+| Своя БД | users_db | hotels_db | reservations_db | payments_db | balances_db | statistics_db | **❌ НЕТ** |
+| RabbitMQ | ❌ | ❌ | ✅ (publisher) | ❌ | ❌ | ✅ (consumer) | **❌** |
+| Вызывает соседей | ❌ | ❌ | hotel, payment, loyalty | ❌ | ❌ | ❌ | **session, hotel, booking, loyalty, report** |
+| Доступен снаружи | ✅ (через Ingress) | ❌ | ❌ | ❌ | ❌ | ❌ | **✅ (через Ingress)** |
+| Env-переменных | 5 | 5 | 18 | 5 | 5 | 10 | **10** |
+| Stateful? | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | **❌ полностью** |
+
+gateway-service **уникален** тем, что:
+- **Не имеет БД вообще** — он не хранит данные, только проксирует.
+- **Самое много исходящих вызовов** — ходит почти ко всем.
+- **Точка входа для всех бизнес-операций** — критично для доступности.
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> gateway-service — единая точка входа в систему (паттерн API Gateway). Deployment с одной репликой на порту 8087. Не имеет собственной БД и не подключён к RabbitMQ — это чисто маршрутизатор. В env-секции 10 переменных: адреса 5 внутренних сервисов (session, hotel, booking, loyalty, report). Service ClusterIP; снаружи доступен через Ingress по адресу gateway.10.174.8.95.nip.io. Все Postman-тесты, кроме Login User, идут через него.
+
+*(длина ~480 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Что такое API Gateway и зачем он нужен?**
+> **API Gateway** — это архитектурный паттерн: единая точка входа, через которую внешние клиенты обращаются к множеству внутренних микросервисов. Основные функции:
+> 
+> 1. **Routing**: маршрутизация запросов на нужный backend-сервис.
+> 2. **Authentication / Authorization**: валидация токенов в одном месте.
+> 3. **Aggregation**: можно собрать данные с нескольких сервисов в один ответ.
+> 4. **Cross-cutting concerns**: rate limit, CORS, логирование, мониторинг, кеширование.
+> 5. **Versioning**: можно держать /api/v1 и /api/v2 одновременно.
+> 6. **Protocol translation**: REST для клиентов, gRPC для внутренних.
+> 7. **Stable contract**: внутренняя архитектура может меняться, клиент не пострадает.
+
+**В2: В чём отличие gateway-service от Ingress-Nginx?**
+> Оба — "входные точки", но на разных уровнях:
+> 
+> **Ingress-Nginx**:
+> - Работает на уровне L7 (HTTP-маршрутизация).
+> - Знает только про path/host → service.
+> - **Не знает про бизнес-логику**: что такое JWT, кто авторизован, нужно ли агрегировать данные.
+> - Это инфраструктурный компонент.
+> 
+> **gateway-service**:
+> - Spring Boot приложение с бизнес-логикой.
+> - Понимает JWT, роли, RBAC.
+> - Может агрегировать данные (запросить hotel + loyalty и собрать в один ответ).
+> - Может трансформировать запросы.
+> 
+> Эти два уровня дополняют друг друга: Ingress пускает трафик в кластер, gateway "понимает" его на уровне приложения.
+
+**В3: Почему gateway сам не делает TLS termination?**
+> Технически он мог бы — поднять HTTPS-listener в Spring Boot, дать сертификат. Но это **антипаттерн**:
+> 
+> 1. **Управление сертификатами** должно быть централизованным: cert-manager обновляет → Ingress подхватывает. У всех сервисов это было бы дублирование.
+> 
+> 2. **Производительность**: Nginx написан на C, оптимизирован для TLS. Spring Boot будет тратить CPU на расшифровку.
+> 
+> 3. **Гранулярность**: Ingress может терминировать TLS для разных хостов с разными сертификатами в одном месте.
+> 
+> 4. **Обновление без рестарта**: Nginx умеет reload без потери соединений. У Spring Boot изменение TLS-конфига требует рестарта.
+> 
+> Стандарт индустрии: **TLS termination на edge** (на уровне Ingress/Load Balancer), внутри кластера — обычный HTTP.
+
+**В4: Почему gateway не имеет POSTGRES env? У него нет БД?**
+> Верно, у gateway-service **нет собственной БД** — это намеренный архитектурный выбор:
+> 
+> 1. **Stateless**: gateway не хранит никаких данных. Он только перенаправляет.
+> 2. **Масштабируемость**: stateless = можно поднять 10 реплик без проблем синхронизации.
+> 3. **Простота**: нет миграций, нет проблем с consistency.
+> 
+> Если gateway вдруг понадобится что-то хранить (например, rate-limit counters) — обычно используют **Redis** или **in-memory кеш** (Caffeine), не PostgreSQL.
+
+**В5: Как gateway валидирует JWT-токены?**
+> Возможные подходы:
+> 
+> **A. Самостоятельно (stateless validation)**:
+> ```java
+> @Component
+> public class JwtValidator {
+>   public Claims validate(String token) {
+>     return Jwts.parserBuilder()
+>       .setSigningKey(publicKey)
+>       .build()
+>       .parseClaimsJws(token)
+>       .getBody();
+>   }
+> }
+> ```
+> Плюсы: быстро (никаких HTTP-вызовов), масштабируется.
+> Минусы: не может отозвать токен до его истечения.
+> 
+> **B. Через session-service (introspection)**:
+> ```java
+> @Component
+> public class JwtValidator {
+>   public ValidationResult validate(String token) {
+>     return sessionClient.validateToken(token);
+>     // GET http://session-service:8081/api/v1/auth/validate
+>   }
+> }
+> ```
+> Плюсы: можно отзывать токены, центральная логика.
+> Минусы: дополнительный HTTP-вызов на каждый запрос.
+> 
+> **C. Гибрид**: валидация JWT локально + чтение черного списка из Redis.
+> 
+> В нашем проекте, судя по env-переменной SESSION_SERVICE_HOST, используется вариант B.
+
+**В6: Что произойдёт, если gateway-service упадёт?**
+> **Полная недоступность бизнес-API!** Все запросы клиентов будут возвращать 502/503/504.
+> 
+> Это **single point of failure**. Защита:
+> 
+> 1. **Несколько реплик**: 3-5 подов за Service'ом. Один упал — другие живые.
+> 2. **Pod Disruption Budget**: гарантия, что во время maintenance не убьют все реплики разом.
+> 3. **Pod Anti-Affinity**: разнести реплики по разным нодам — нода умерла, реплики на других живы.
+> 4. **HPA**: автомасштабирование при росте RPS.
+> 5. **Liveness/Readiness probes**: автоматический рестарт зависших подов.
+> 
+> Login User не пострадает — он через session-service (тоже хорошо иметь несколько реплик).
+
+**В7: Почему в env-переменных нет PAYMENT_SERVICE_HOST? Это ошибка?**
+> Нет, это **архитектурное решение**! Принцип **least privilege**:
+> 
+> - Платежи — критическая операция, должна инициироваться только из контролируемого места.
+> - Если gateway мог бы вызывать payment напрямую — это была бы дыра: компрометация gateway → возможность списания денег.
+> - **booking-service** — единственный, кто инициирует платёж: он понимает контекст (есть бронь? сумма правильная?).
+> 
+> Постман-тест "Book Hotel" идёт так:
+> ```
+> Postman → gateway → booking-service → payment-service
+> ```
+> Никогда не:
+> ```
+> Postman → gateway → payment-service   ❌ запрещено!
+> ```
+
+**В8: Что произойдёт, если изменить ConfigMap (например, поменять имя hotel-service)?**
+> Сразу — ничего. gateway-service читает env при старте, один раз. Изменение ConfigMap не повлияет на запущенные поды.
+> 
+> Чтобы применить изменение:
+> ```bash
+> kubectl rollout restart deploy/gateway-service
+> ```
+> Это создаст новый под с обновлённой конфигурацией.
+> 
+> **Лучшая практика**: автоматический рестарт при изменении ConfigMap. Решения:
+> 1. **Stakater/Reloader** — оператор, который слушает изменения ConfigMap/Secret и рестартует Deployment.
+> 2. **Helm chart с checksum** — checksum ConfigMap в аннотациях Deployment → меняется → rollout.
+> 3. **Spring Cloud Config Server** — приложение слушает изменения само.
+
+**В9: Чем отличается роль gateway в Postman-тестах от роли session?**
+> Хороший вопрос на нюанс:
+> 
+> **session-service** — выдаёт токены:
+> ```
+> Test 1: Login User
+> GET https://session.10.174.8.95.nip.io/api/v1/auth/authorize
+> Authorization: Basic VXNlcjpxd2VydHk=   ← Basic Auth (логин:пароль)
+> → 200 OK
+> ← Authorization: Bearer eyJhbGc...      ← возвращает Bearer-токен
+> ```
+> 
+> **gateway-service** — обрабатывает все остальные запросы с токеном:
+> ```
+> Test 2-5:
+> GET https://gateway.10.174.8.95.nip.io/api/v1/gateway/hotels
+> Authorization: Bearer eyJhbGc...        ← использует токен от session
+> ```
+> 
+> Это два разных endpoint'а:
+> - session = аутентификация (кто ты?)
+> - gateway = авторизация + бизнес-логика (что ты хочешь?)
+
+**В10: Какие resource limits подойдут для gateway-service?**
+> Это критичный сервис, ему нужно больше ресурсов:
+> ```yaml
+> resources:
+>   requests:
+>     cpu: "200m"      # гарантированные 0.2 CPU
+>     memory: "512Mi"
+>   limits:
+>     cpu: "1000m"     # до 1 CPU при пиках
+>     memory: "1Gi"
+> ```
+> 
+> Spring Cloud Gateway — асинхронный, на Netty. Может обрабатывать тысячи RPS на одной реплике. Главное — не упереться в memory из-за GC.
+
+**В11: Можно ли запустить gateway-service на 5 репликах? Нужны ли какие-то изменения?**
+> Да, можно! gateway полностью stateless, поэтому масштабирование тривиальное:
+> ```bash
+> kubectl scale deploy/gateway-service --replicas=5
+> ```
+> 
+> Подводные камни:
+> 1. **Connection pool до downstream-сервисов**: 5 реплик × 50 коннектов = 250 коннектов к каждому из 5 сервисов = 1250 коннектов всего. Может упереться в `max_connections` PostgreSQL (но gateway не ходит в БД, ОК).
+> 2. **Балансировка**: Service автоматически round-robin между подами.
+> 3. **Sticky sessions** не нужны: каждый запрос независим.
+> 4. **Rate-limit counters**: если используются — должны быть в Redis (общий), не в памяти.
+
+**В12: Какие cross-cutting concerns gateway должен решать?**
+> Типичный список:
+> 
+> 1. **Authentication / Authorization**: проверка JWT.
+> 2. **Rate Limiting**: защита от перегрузки (например, 100 RPS на IP).
+> 3. **CORS**: разрешённые origins, headers.
+> 4. **Request/Response logging**: для аудита и debug.
+> 5. **Metrics**: счётчики запросов, latency по эндпоинтам (Prometheus).
+> 6. **Tracing**: distributed tracing (Jaeger, Zipkin) — добавление trace-id.
+> 7. **Request validation**: проверка body, headers до отправки в backend.
+> 8. **Response transformation**: маскирование чувствительных полей.
+> 9. **Caching**: кеширование GET-запросов (например, /hotels на 5 минут).
+> 10. **Circuit breaker**: защита от каскадных отказов.
+> 11. **Retry logic**: повтор запросов к flaky-сервисам.
+> 12. **Compression**: gzip ответов.
+
+**В13: Что если кто-то попробует обратиться напрямую к hotel-service в обход gateway?**
+> Снаружи кластера — **невозможно**, hotel-service ClusterIP, не имеет Ingress.
+> 
+> Изнутри кластера (из другого пода) — **возможно**:
+> ```bash
+> kubectl run debug --rm -it --image=curlimages/curl -- sh
+> curl http://hotel-service:8082/api/v1/hotels
+> # → 200 OK с данными отелей (без аутентификации!)
+> ```
+> 
+> Это **дыра безопасности внутри кластера**. Защита:
+> 1. **NetworkPolicy**: hotel-service принимает трафик только от gateway:
+> ```yaml
+> spec:
+>   podSelector:
+>     matchLabels: { app: hotel-service }
+>   ingress:
+>     - from:
+>         - podSelector:
+>             matchLabels: { app: gateway-service }
+> ```
+> 2. **Service Mesh** (Istio/Linkerd) с mTLS + Authorization Policy.
+> 3. **JWT валидация в каждом сервисе** (defence in depth).
+
+Если по какой-то строке хочется глубже — спрашивай 🚀

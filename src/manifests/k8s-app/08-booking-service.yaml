@@ -64,3 +64,459 @@ spec:
     - port: 8083
       targetPort: 8083
   type: ClusterIP
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор Deployment + Service для booking-service
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment booking-service
+# Микросервис бронирования — ЯДРО бизнес-логики приложения.
+# Это самый "толстый" сервис: общается со всеми соседями
+# (hotel, payment, loyalty) + публикует события в RabbitMQ.
+#
+# Поток "забронировать номер":
+#   1. Postman → gateway → booking-service
+#   2. booking → hotel-service: "есть такой отель/номер?"
+#   3. booking → payment-service: "проведи оплату"
+#   4. booking → loyalty-service: "начисли баллы"
+#   5. booking → RabbitMQ: publish event "новая бронь"
+#   6. report-service подпишется и обработает
+# ============================================================
+apiVersion: apps/v1                  # API-группа apps, версия v1.
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: booking-service              # Имя Deployment'а.
+  labels: { app: booking-service }   # Метка на Deployment (inline YAML).
+spec:
+  replicas: 1                        # Одна реплика для лабы.
+                                     # ⚠️ В продакшне для booking-service:
+                                     # - 3+ реплики (это write-heavy + критически важный),
+                                     # - autoscaling по CPU/RPS,
+                                     # - идемпотентность операций (на случай retry).
+  selector:
+    matchLabels: { app: booking-service }
+                                     # Какие поды Deployment контролирует.
+  template:                          # Шаблон создаваемых подов.
+    metadata:
+      labels: { app: booking-service }
+                                     # Метка пода — обязана совпадать с селектором.
+    spec:
+      containers:
+        - name: booking-service      # Имя контейнера в поде.
+          image: src-booking-service:latest
+                                     # Локальный Docker-образ из проекта DO10.
+                                     # Spring Boot приложение с REST API + AMQP клиент.
+          imagePullPolicy: Never     # Использовать ТОЛЬКО локальный образ из containerd.
+                                     # Должен быть импортирован заранее:
+                                     #   k3s ctr images import booking-service.tar
+          ports:
+            - containerPort: 8083    # Порт Spring Boot приложения.
+                                     # Согласован с ConfigMap (BOOKING_SERVICE_PORT: "8083").
+          env:                       # ОЧЕНЬ много env-переменных — самая длинная секция!
+                                     # booking-service интегрируется со множеством сервисов.
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-1: Подключение к PostgreSQL
+            # ─────────────────────────────────────────────
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: POSTGRES_HOST # → "postgres" (имя Service'а БД)
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: POSTGRES_PORT }
+                                     # → "5432"
+            - name: POSTGRES_DB
+              value: reservations_db # ⚠️ Своя БД для бронирований!
+                                     # Внимание: имя БД отличается от логики "bookings_db",
+                                     # которое было в ConfigMap-документации.
+                                     # Реально имя БД определяется init-скриптом образа
+                                     # src-postgres. Если в БД нет reservations_db —
+                                     # сервис упадёт с FATAL: database does not exist.
+                                     # Должно совпадать с тем, что создаёт init-скрипт.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_USER }
+                                     # Логин из Secret (base64 → "postgres").
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD }
+                                     # Пароль из Secret.
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-2: Подключение к RabbitMQ
+            # booking-service публикует события о новых бронях.
+            # report-service подписан на эти события.
+            # ─────────────────────────────────────────────
+            - name: RABBIT_MQ_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: RABBIT_MQ_HOST }
+                                     # → "rabbitmq" (имя Service'а)
+            - name: RABBIT_MQ_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: RABBIT_MQ_PORT }
+                                     # → "5672" (стандартный AMQP-порт)
+            - name: RABBIT_MQ_QUEUE_NAME
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: RABBIT_MQ_QUEUE_NAME }
+                                     # → "booking_statistics_queue"
+                                     # Очередь, куда падают события о бронированиях.
+                                     # Spring AMQP при старте создаст её автоматически,
+                                     # если не существует.
+            - name: RABBIT_MQ_EXCHANGE
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: RABBIT_MQ_EXCHANGE }
+                                     # → "booking_statistics_exchange"
+                                     # Exchange, куда publish-ит сообщения.
+                                     # Связь exchange → queue настраивается через binding
+                                     # (тоже автоматически Spring AMQP).
+            - name: RABBIT_MQ_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: RABBIT_MQ_USER }
+                                     # → "guest" (из Secret)
+            - name: RABBIT_MQ_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: RABBIT_MQ_PASSWORD }
+                                     # → "guest" (из Secret)
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-3: Адрес hotel-service
+            # При бронировании проверяем существование отеля,
+            # доступность номера, цену.
+            # ─────────────────────────────────────────────
+            - name: HOTEL_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: HOTEL_SERVICE_HOST }
+                                     # → "hotel-service"
+            - name: HOTEL_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: HOTEL_SERVICE_PORT }
+                                     # → "8082"
+                                     # Полный URL для HTTP-вызова:
+                                     #   http://hotel-service:8082/api/v1/hotels/{uid}
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-4: Адрес payment-service
+            # При создании брони → проводим оплату.
+            # Это синхронный HTTP-вызов: бронь создаётся только
+            # после успешной оплаты (или сразу отменяется).
+            # ─────────────────────────────────────────────
+            - name: PAYMENT_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: PAYMENT_SERVICE_HOST }
+                                     # → "payment-service"
+            - name: PAYMENT_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: PAYMENT_SERVICE_PORT }
+                                     # → "8084"
+
+            # ─────────────────────────────────────────────
+            # БЛОК env-5: Адрес loyalty-service
+            # После успешной брони → начисляем баллы лояльности.
+            # Это тоже HTTP-вызов, может быть синхронным или
+            # асинхронным через RabbitMQ.
+            # ─────────────────────────────────────────────
+            - name: LOYALTY_SERVICE_HOST
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: LOYALTY_SERVICE_HOST }
+                                     # → "loyalty-service"
+            - name: LOYALTY_SERVICE_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: LOYALTY_SERVICE_PORT }
+                                     # → "8085"
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для booking-service
+# Внутренний сервис, доступен только из кластера.
+# К нему обращается ТОЛЬКО gateway-service.
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Балансировщик + DNS-имя.
+metadata:
+  name: booking-service              # КЛЮЧЕВОЕ! По имени резолвится через CoreDNS.
+                                     # gateway-service делает HTTP:
+                                     #   POST http://booking-service:8083/api/v1/bookings
+  labels: { app: booking-service }   # Метка на Service.
+spec:
+  selector: { app: booking-service } # Трафик идёт в поды с этим лейблом.
+  ports:
+    - port: 8083                     # Порт Service'а (входящий).
+      targetPort: 8083               # Порт пода (= containerPort).
+  type: ClusterIP                    # Только из кластера.
+                                     # Снаружи к нему НЕТ доступа — это правильно,
+                                     # внешний доступ только через gateway.
+```
+
+---
+
+## 🔗 Полный жизненный цикл "Book Hotel" из Postman
+
+Самый сложный сценарий в проекте — четвёртый тест в коллекции:
+
+```
+   [ Postman ]
+        │ POST https://gateway.10.174.8.95.nip.io/api/v1/gateway/booking
+        │ Body: { hotelUid, room, paymentInfo, dateInterval, roomCost }
+        │ Authorization: Bearer eyJhbGc...
+        ▼
+   [ Ingress → gateway-service:8087 ]
+        │ 1. Валидирует JWT
+        │ 2. Маршрутизирует в booking
+        ▼
+   [ POST http://booking-service:8083/api/v1/bookings ]
+        │
+        ▼
+   ┌─────────────────────────────────────────────────────┐
+   │ Pod booking-service                                  │
+   │                                                      │
+   │ Шаг 1: Проверка отеля                                │
+   │ ▼ GET http://hotel-service:8082/api/v1/hotels/{uid}  │
+   │   ← 200 OK: {hotel info, цена, доступность}          │
+   │                                                      │
+   │ Шаг 2: Создание оплаты                               │
+   │ ▼ POST http://payment-service:8084/api/v1/payments   │
+   │   { amount: 2000, info: "somePaymentInfo" }          │
+   │   ← 201 Created: {paymentUid, status: "PAID"}        │
+   │                                                      │
+   │ Шаг 3: Сохранение брони в БД                         │
+   │ ▼ INSERT INTO bookings ... → reservations_db         │
+   │                                                      │
+   │ Шаг 4: Начисление баллов                             │
+   │ ▼ POST http://loyalty-service:8085/api/v1/loyalty    │
+   │   { userId, points: 200 }                            │
+   │   ← 200 OK                                           │
+   │                                                      │
+   │ Шаг 5: Публикация события статистики                 │
+   │ ▼ AMQP publish to rabbitmq:5672                      │
+   │   exchange: booking_statistics_exchange              │
+   │   routing-key: booking.created                       │
+   │   payload: {bookingUid, hotelUid, userId, amount}    │
+   │                                                      │
+   │ Шаг 6: Возврат клиенту                               │
+   │ ▼ 201 Created: {bookingUid, status, дата}            │
+   └─────────────────────────────────────────────────────┘
+        │
+        │ Параллельно — асинхронно:
+        ▼
+   [ RabbitMQ ─ booking_statistics_queue ]
+        │
+        ▼
+   [ report-service подписан → сохраняет статистику в report_db ]
+
+
+Итог в Postman: 201 Created.
+```
+
+**Это распределённая транзакция!** В реальном продакшне обычно реализуется через **Saga pattern**: если payment упал — отменить бронь и т.д. У нас в учебном проекте логика, скорее всего, упрощена.
+
+---
+
+## 🌐 Booking-service — центр звезды коммуникаций
+
+```
+                   [ gateway-service ]
+                          │
+                          │ POST /api/v1/bookings
+                          ▼
+              ┌────────────────────────┐
+              │   booking-service      │
+              │     :8083              │
+              └─────┬────┬────┬───┬────┘
+                    │    │    │   │
+        ┌───────────┘    │    │   └────────────┐
+        │            ┌───┘    └────┐           │
+        ▼            ▼             ▼           ▼
+  [ PostgreSQL ] [ hotel ]   [ payment ]  [ loyalty ]
+  reservations    :8082        :8084        :8085
+  _db
+        │
+        │ (тут же)
+        ▼
+  [ RabbitMQ :5672 ]
+   exchange: booking_statistics_exchange
+        │
+        ▼ subscribed
+  [ report-service ]
+   → report_db
+```
+
+booking-service — это **узел-интегратор**: координирует работу 4 других сервисов и брокера. Это значит, у него ВСЕГДА самое много env-переменных.
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> booking-service — ядро бизнес-логики, оркестрирует процесс бронирования. Deployment с одной репликой запускает образ src-booking-service на порту 8083. Самая толстая секция env: подключение к PostgreSQL (БД reservations_db), к RabbitMQ для публикации событий и адреса трёх соседних сервисов — hotel, payment и loyalty. Service ClusterIP, доступ снаружи только через gateway-service.
+
+*(длина ~420 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Почему у booking-service так много env-переменных по сравнению с hotel-service?**
+> Потому что booking-service — это **узел-интегратор**. Он один взаимодействует со ВСЕМИ соседями:
+> - **Read** из hotel-service (узнать про отель).
+> - **Write** в payment-service (провести оплату).
+> - **Write** в loyalty-service (начислить баллы).
+> - **Publish** в RabbitMQ (событие статистики).
+> - **Read/Write** в свою PostgreSQL.
+> 
+> hotel-service же — простой "поставщик данных", читает из своей БД и отдаёт. Поэтому ему нужны только POSTGRES_*.
+
+**В2: Что произойдёт, если payment-service временно недоступен?**
+> Зависит от реализации booking-service. Варианты:
+> 
+> 1. **Без обработки**: HTTP-вызов упадёт с `ConnectException` → исключение → клиент получит 500. Плохо.
+> 2. **Retry**: Spring Retry повторит запрос N раз с backoff. Если payment всё ещё лежит — ошибка.
+> 3. **Circuit breaker** (Resilience4j): после N ошибок "размыкает" цепь, дальше быстро отдаёт ошибку без вызова. Защищает от каскадного падения.
+> 4. **Saga / Outbox pattern**: бронь создаётся в pending-статусе, payment вызывается асинхронно. При успехе — confirm, при провале — rollback.
+> 
+> Правильный production подход — комбинация 3 и 4.
+
+**В3: Что такое Saga pattern и почему он важен?**
+> В распределённой системе **нет глобальных транзакций**. Если в монолите можно было `BEGIN TRANSACTION ... COMMIT/ROLLBACK`, то здесь:
+> - booking-service сохранил бронь.
+> - payment-service провёл оплату.
+> - loyalty-service упал — не начислил баллы.
+> - КАК откатить первые два? Старая транзакция уже закоммичена!
+> 
+> Saga решает это через **компенсирующие действия**:
+> - Каждый шаг имеет "обратное действие": Cancel Booking, Refund Payment, Revoke Points.
+> - При неудаче выполняются компенсации в обратном порядке.
+> - Реализуется через **оркестратор** (booking управляет всем) или **хореографию** (события в RabbitMQ).
+> 
+> Это паттерн eventual consistency.
+
+**В4: Почему статистика через RabbitMQ, а не HTTP-вызов в report-service?**
+> Это разные паттерны для разных целей:
+> 
+> **HTTP (синхронный)**: для случаев, когда **результат критичен и нужен немедленно**:
+> - Оплата прошла? Да/нет.
+> - Отель свободен? Да/нет.
+> 
+> **RabbitMQ (асинхронный)**: для случаев, когда **критичен сам факт события, но не результат немедленно**:
+> - Статистика бронирований — её можно собирать с задержкой.
+> - Email-уведомления — клиенту неважно, отправлено через 100мс или 5 сек.
+> - Аудит-лог.
+> 
+> Плюсы async:
+> - report-service может падать/перезапускаться — события не теряются.
+> - booking-service быстрее отвечает клиенту (не ждёт repor t-service).
+> - Можно горизонтально масштабировать обработчики.
+
+**В5: Что произойдёт, если booking-service упадёт после INSERT в БД, но до publish в RabbitMQ?**
+> Это классическая проблема **dual-write**. Симптом: бронь есть в БД, но статистика её "не видит" — записи в report_db не будет.
+> 
+> Решения:
+> 
+> 1. **Transactional Outbox pattern**:
+>    - В той же транзакции INSERT booking + INSERT в таблицу `outbox`.
+>    - Отдельный поток читает outbox и publish-ит в RabbitMQ.
+>    - Если упадём — после рестарта outbox обработается заново.
+> 
+> 2. **CDC (Change Data Capture)**:
+>    - Debezium читает WAL PostgreSQL и автоматически публикует в Kafka/RabbitMQ.
+>    - Никакой dual-write вообще не нужен.
+> 
+> 3. **При старте проверять и публиковать unprocessed**:
+>    - В таблице добавить флаг `published: bool`.
+>    - При старте — найти `published=false` и опубликовать.
+
+**В6: Почему RABBIT_MQ_QUEUE_NAME лежит в ConfigMap, а POSTGRES_DB — нет?**
+> Это **инконсистентность** в моём проекте. Логичнее было бы:
+> - Если БД у каждого сервиса своя → POSTGRES_DB в Deployment'е (как сейчас).
+> - Если очередь у каждого тоже своя → RABBIT_MQ_QUEUE_NAME в Deployment'е.
+> 
+> Но я положил queue в ConfigMap, потому что:
+> - **Очередь и exchange общие** для booking (producer) и report (consumer) — обоим нужно одно имя. Удобно держать в общем месте.
+> - Если каждый сервис продьюсит в свою очередь — лучше в Deployment.
+> 
+> Это вопрос дизайна, не ошибка.
+
+**В7: Что произойдёт, если все три соседних сервиса (hotel/payment/loyalty) недоступны одновременно?**
+> Без обработки ошибок — booking-service застрянет в попытках вызвать их с timeout по 30-60 секунд. Все потоки пула HTTP-клиента заняты → новые запросы клиентов отвергаются → лавина.
+> 
+> Это **каскадный отказ** (cascading failure). Защита:
+> 
+> 1. **Короткие таймауты** (1-3 сек) на HTTP-вызовы.
+> 2. **Circuit breaker** — после N ошибок сразу возвращать failure, не делая вызов.
+> 3. **Bulkheading** — раздельные пулы потоков для разных downstream-сервисов.
+> 4. **Graceful degradation** — отдать клиенту "сейчас бронирование недоступно, попробуйте позже".
+
+**В8: Что если две Postman-сессии одновременно бронируют один номер в одном отеле?**
+> Это **race condition**. Возможные сценарии:
+> 
+> 1. Оба `SELECT room WHERE status='free'` → видят свободный.
+> 2. Оба `INSERT booking` → две брони на одну ночь!
+> 
+> Защита:
+> 
+> 1. **Pessimistic lock** в БД: `SELECT ... FOR UPDATE` — блокирует строку до commit.
+> 2. **Optimistic lock**: версионное поле, сравнение при UPDATE.
+> 3. **Unique constraint** в БД: `UNIQUE(hotel_id, room, date)` — второй INSERT упадёт.
+> 4. **Distributed lock** (Redis): захват замка перед операцией.
+> 
+> В нашем учебном проекте, скорее всего, нет защиты — это нормальный технический долг для лабораторной.
+
+**В9: Можно ли разнести booking-service по нескольким репликам, если он публикует в RabbitMQ?**
+> Да, без проблем! RabbitMQ — multi-publisher safe:
+> - Каждый под открывает свой connection к RabbitMQ.
+> - Publish — атомарная операция, конфликтов между публикаторами нет.
+> - Очередь поглощает сообщения от любого количества producer'ов.
+> 
+> Проблема может быть только в **подписке**: если report-service слушает очередь в нескольких репликах — сообщения распределятся между ними (competing consumers), что обычно желаемо. Если не желаемо — нужно настраивать exclusive consumer.
+
+**В10: Что произойдёт при `kubectl rollout restart deploy/booking-service`?**
+> Зависит от стратегии (по умолчанию RollingUpdate):
+> 
+> 1. k8s создаёт новый под booking-service-v2.
+> 2. Ждёт его Readiness (по readinessProbe; у нас не настроен → как только container started).
+> 3. Service добавляет v2 в endpoints, убирает v1.
+> 4. Граcefully shutdown v1 (SIGTERM → 30 сек на завершение → SIGKILL).
+> 5. Результат: zero-downtime restart.
+> 
+> ⚠️ Без readiness probe Service может начать слать трафик ДО того, как Spring Boot прогрузится → 502 в течение 10-20 секунд. Стоит добавить readiness probe в Spring Actuator `/actuator/health`.
+
+**В11: Какие resource limits я бы поставил в продакшне для booking-service?**
+> Примерно так:
+> ```yaml
+> resources:
+>   requests:
+>     cpu: "100m"      # гарантированные 0.1 CPU
+>     memory: "256Mi"  # гарантированная RAM
+>   limits:
+>     cpu: "500m"      # максимум 0.5 CPU
+>     memory: "512Mi"  # максимум RAM, иначе OOMKill
+> ```
+> 
+> Spring Boot стартует медленно и кушает память, поэтому memory limit нельзя жёстко урезать. CPU можно — Spring переживёт throttling.
+> 
+> requests влияют на scheduling, limits — на cgroup ограничения.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀

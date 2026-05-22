@@ -40,3 +40,360 @@ spec:
     - port: 8082
       targetPort: 8082
   type: ClusterIP
+
+
+
+# 📝 Построчный разбор Deployment + Service для hotel-service
+
+## 🔍 Полный комментарий по каждой строке
+
+```yaml
+# ============================================================
+# БЛОК 1: Deployment hotel-service
+# Микросервис управления отелями: каталог, поиск, информация
+# по конкретному отелю. Stateless: данные в PostgreSQL, в памяти
+# ничего не хранит.
+#
+# В Postman: запросы Get Hotels и Get Hotel идут на gateway,
+# который проксирует их сюда. Прямого доступа из Postman нет —
+# только через gateway-service (порт 8087).
+# ============================================================
+apiVersion: apps/v1                  # API-группа apps, версия v1.
+kind: Deployment                     # Тип ресурса: управляемый набор подов.
+metadata:
+  name: hotel-service                # Имя Deployment'а.
+                                     # Совпадает с именем Service ниже — типовая практика.
+  labels: { app: hotel-service }     # Метка на Deployment (inline YAML).
+spec:
+  replicas: 1                        # Одна реплика для лабы.
+                                     # ⚠️ hotel-service — read-heavy (90% запросов = SELECT).
+                                     # В продакшне горизонтально масштабируется ОТЛИЧНО:
+                                     # 5-10 реплик за Service'ом, балансировка round-robin,
+                                     # никакого состояния в памяти.
+  selector:
+    matchLabels: { app: hotel-service }
+                                     # Селектор: какие поды считать "своими" для Deployment.
+  template:                          # Шаблон пода — то, ЧТО создавать.
+    metadata:
+      labels: { app: hotel-service } # Метка пода. Совпадает с селектором — иначе не свяжутся.
+    spec:
+      containers:
+        - name: hotel-service        # Имя контейнера внутри пода.
+          image: src-hotel-service:latest
+                                     # Локальный Docker-образ из проекта DO10.
+                                     # Spring Boot приложение, упакованное в Docker.
+                                     # Собирается через docker build в директории
+                                     # services/hotel-service/.
+          imagePullPolicy: Never     # Использовать ТОЛЬКО локальный образ.
+                                     # Образ должен быть импортирован в containerd k3s:
+                                     #   k3s ctr images import hotel-service.tar
+                                     # Иначе ErrImageNeverPull при старте.
+          ports:
+            - containerPort: 8082    # Порт, на котором слушает Spring Boot.
+                                     # Прописан в application.yml сервиса:
+                                     #   server.port=8082
+                                     # Согласован с ConfigMap (HOTEL_SERVICE_PORT: "8082").
+          env:                       # Переменные окружения для конфигурации.
+
+            # ----- Подключение к PostgreSQL -----
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: POSTGRES_HOST # → "postgres"
+                                     # DNS-имя Service'а PostgreSQL внутри кластера.
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef: { name: app-config, key: POSTGRES_PORT }
+                                     # → "5432" (строка).
+            - name: POSTGRES_DB
+              value: hotels_db       # ⚠️ Plain value — отличается от других сервисов!
+                                     # Каждый сервис ходит в свою БД:
+                                     #   session-service  → users_db
+                                     #   hotel-service    → hotels_db    ← вот эта
+                                     #   booking-service  → bookings_db
+                                     #   payment-service  → payments_db
+                                     #   loyalty-service  → loyalty_db
+                                     #   report-service   → report_db
+                                     # БД hotels_db создаётся init-скриптом в образе src-postgres.
+
+            # ----- Учётные данные PostgreSQL -----
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_USER }
+                                     # Логин postgres из Secret (base64 → "postgres").
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: app-secrets, key: POSTGRES_PASSWORD }
+                                     # Пароль из Secret.
+
+---                                   # YAML-разделитель.
+
+# ============================================================
+# БЛОК 2: Service для hotel-service
+# Даёт стабильное DNS-имя "hotel-service:8082" внутри кластера.
+# По этому имени gateway-service ходит к нему за каталогом отелей.
+# ============================================================
+apiVersion: v1                       # Core API.
+kind: Service                        # Балансировщик + DNS-имя.
+metadata:
+  name: hotel-service                # КЛЮЧЕВОЕ! По имени обращаются другие сервисы.
+                                     # В ConfigMap: HOTEL_SERVICE_HOST: hotel-service
+                                     # CoreDNS резолвит "hotel-service" → ClusterIP Service'а.
+                                     # gateway-service делает HTTP GET:
+                                     #   http://hotel-service:8082/api/v1/hotels
+  labels: { app: hotel-service }     # Метка на Service'е.
+spec:
+  selector: { app: hotel-service }   # Трафик идёт в поды с этим лейблом.
+  ports:
+    - port: 8082                     # Порт Service'а — то, что видят другие поды.
+                                     #   http://hotel-service:8082
+      targetPort: 8082               # Порт пода (= containerPort из Deployment).
+                                     # Совпадение port == targetPort = единообразие.
+                                     # Могло быть и иначе, например:
+                                     #   port: 80, targetPort: 8082 — Service на 80,
+                                     #   но в подах приложение на 8082. Лишний уровень
+                                     #   абстракции для лабы не нужен.
+  type: ClusterIP                    # Только из кластера.
+                                     # ⚠️ hotel-service — ВНУТРЕННИЙ микросервис!
+                                     # Снаружи к нему НЕ ходят (нет Ingress).
+                                     # Только gateway-service вызывает его через ClusterIP.
+                                     # Это правильная архитектура: внешний доступ
+                                     # ТОЛЬКО через gateway, остальные скрыты.
+```
+
+---
+
+## 🔗 Путь запроса Postman → hotel-service
+
+В отличие от session-service, к hotel-service **нет прямого внешнего доступа**. Запросы идут через gateway:
+
+```
+   [ Postman ]
+            │
+            │ GET https://gateway.10.174.8.95.nip.io/api/v1/gateway/hotels
+            │ Authorization: Bearer eyJhbGc...
+            ▼
+   [ DNS nip.io → 10.174.8.95 ]
+            │
+            ▼
+   [ Ingress-Nginx ]
+            │ TLS termination, host-routing
+            │ → backend: gateway-service:8087
+            ▼
+   [ Service gateway-service (ClusterIP) ]
+            │
+            ▼
+   [ Pod gateway-service-xxx ]
+            │
+            │ 1. Валидирует JWT-токен (или спрашивает session-service)
+            │ 2. Решает: запрос /hotels → проксируем в hotel-service
+            │
+            │ HTTP GET http://hotel-service:8082/api/v1/hotels
+            ▼
+   [ CoreDNS: hotel-service → ClusterIP ]
+            │
+            ▼
+   [ Service hotel-service (ClusterIP) ]
+            │
+            ▼
+   [ Pod hotel-service-xxx ]
+            │
+            │ Spring Boot Controller обрабатывает запрос
+            │
+            │ JDBC: jdbc:postgresql://postgres:5432/hotels_db
+            ▼
+   [ Service postgres → Pod postgres ]
+            │
+            │ SELECT * FROM hotels;
+            ▼
+   [ Список отелей возвращается обратно по цепочке ]
+            │
+            ▼
+   [ Postman: 200 OK + JSON со списком отелей ]
+```
+
+**Ключевое отличие от session-service:** snare к hotel-service не пробрасывается напрямую — он скрыт за gateway.
+
+---
+
+## 🌐 Как hotel-service вписывается в общую архитектуру
+
+```
+                       ВНЕШНИЙ МИР
+                            │
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+    Ingress: session.*           Ingress: gateway.*
+              │                           │
+              ▼                           ▼
+    [ session-service ]         [ gateway-service ]
+       :8081 (вход)                :8087 (вход)
+            │                            │
+            │ JWT валидация              │ маршрутизация
+            │                            │
+            │  ◄────────────────────────┤
+            │  (gateway спрашивает       │
+            │   session о валидности    │
+            │   токена)                 │
+            │                            │
+            │              ┌─────────────┼─────────────┬─────────────┐
+            │              ▼             ▼             ▼             ▼
+            │   [ hotel-service ] [ booking-service ] [ payment-service ] [ loyalty-service ]
+            │      :8082            :8083              :8084              :8085
+            │         │                │                  │                   │
+            │         │                │ event            │                   │
+            │         │                ▼                  │                   │
+            │         │       [ RabbitMQ ] ──── [ report-service ] :8086     │
+            │         │           :5672                                       │
+            │         │                                                      │
+            │         └────────────────┴──────────┬───────────────────────────┘
+            │                                     │
+            └─────────────────────────────────────┴──────┐
+                                                         ▼
+                                              [ PostgreSQL :5432 ]
+                                              hotels_db, bookings_db,
+                                              payments_db, loyalty_db,
+                                              users_db, report_db
+```
+
+hotel-service — это просто "поставщик данных" об отелях, к нему ходят:
+- **gateway-service** — основной потребитель (для эндпоинтов /hotels).
+- **booking-service** — возможно, для валидации существования отеля при бронировании.
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> hotel-service — микросервис каталога отелей. Deployment с одной репликой запускает локальный образ src-hotel-service на порту 8082. Адрес и порт PostgreSQL берутся из ConfigMap, креды — из Secret, имя БД hotels_db задано в манифесте, так как у каждого сервиса своя БД. Service ClusterIP делает его доступным изнутри кластера; снаружи к нему обращаются только через gateway-service.
+
+*(длина ~430 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Чем этот манифест отличается от session-service?**
+> Всего три отличия:
+> 1. **Имена ресурсов**: hotel-service вместо session-service.
+> 2. **Образ**: `src-hotel-service:latest` (своя кодовая база).
+> 3. **Порт**: 8082 вместо 8081 (согласовано с ConfigMap).
+> 4. **БД**: `hotels_db` вместо `users_db` (изоляция данных).
+> 
+> Структура идентична — это **типовой шаблон Spring Boot микросервиса в k8s**. Все 6 микросервисов проекта повторяют один и тот же паттерн с небольшими вариациями.
+
+**В2: Почему `replicas: 1`, если hotel-service stateless и легко масштабируется?**
+> Только из-за ограничений лабораторного кластера: у меня 3 узла k3s с минимальными ресурсами, и поднимать по 3 пода на каждый из 6 сервисов = 18 подов только под бизнес-логику + БД + RabbitMQ + Ingress + cert-manager + monitoring. Это перегруз кластера.
+> 
+> В продакшне для read-heavy сервисов типа hotel-service:
+> - **Минимум 2 реплики** для отказоустойчивости.
+> - **HPA** (Horizontal Pod Autoscaler) — автомасштабирование по CPU/RPS.
+> - Можно держать 3-10 реплик в зависимости от нагрузки.
+
+**В3: Зачем hotel-service отдельная БД? Не проще ли одна общая?**
+> Это **Database per Service** — один из ключевых принципов микросервисной архитектуры:
+> 
+> 1. **Изоляция данных**: hotel-service не может случайно или специально полезть в чужие таблицы.
+> 2. **Независимая эволюция схем**: можно делать миграции в hotels_db без согласования с другими командами.
+> 3. **Возможность подмены БД**: завтра hotel-service переедет с PostgreSQL на MongoDB — никто не пострадает.
+> 4. **Производительность**: можно тюнить hotels_db под read-нагрузку (индексы, репликация), а bookings_db — под транзакции.
+> 
+> Общая БД = **distributed monolith**, антипаттерн.
+
+**В4: Почему hotel-service не нужен в Ingress?**
+> Потому что у него **нет прямого внешнего интерфейса**. Все запросы клиентов идут через gateway-service, который:
+> 1. Принимает HTTP-запросы извне.
+> 2. Аутентифицирует (через session-service).
+> 3. Маршрутизирует на нужный backend (hotel-service, booking-service и т.д.).
+> 4. Может агрегировать ответы от нескольких сервисов.
+> 5. Применяет rate limiting, кеширование, логирование.
+> 
+> Это паттерн **API Gateway**. Внутренние сервисы спрятаны за ним — это безопаснее (меньше attack surface) и удобнее (один URL для клиента).
+
+**В5: Что произойдёт, если hotel-service упадёт?**
+> 1. Pod упадёт → Deployment контроллер заметит → создаст новый под (replicas: 1 надо поддерживать).
+> 2. Между падением и стартом нового пода (~10-30 секунд) Service не имеет endpoint'ов → kube-proxy возвращает connection refused.
+> 3. gateway-service получит ошибку → должен отдать клиенту 502/503/504 (зависит от реализации).
+> 4. Postman-тесты на /hotels провалятся в этот промежуток.
+> 
+> Для смягчения проблемы:
+> - **Несколько реплик** — отказоустойчивость.
+> - **Circuit breaker** в gateway (Resilience4j) — быстро отдавать кешированные данные или ошибку.
+> - **Retry с backoff** — попробовать ещё раз через секунду.
+
+**В6: Как hotel-service узнаёт, где найти PostgreSQL?**
+> Через ConfigMap → env переменную → application.yml:
+> ```yaml
+> spring:
+>   datasource:
+>     url: jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+>     username: ${POSTGRES_USER}
+>     password: ${POSTGRES_PASSWORD}
+> ```
+> 
+> При старте Spring Boot подставит:
+> - `POSTGRES_HOST` = "postgres" (имя Service).
+> - `POSTGRES_PORT` = "5432".
+> - `POSTGRES_DB` = "hotels_db".
+> 
+> Финальный URL: `jdbc:postgresql://postgres:5432/hotels_db`.
+> CoreDNS резолвит "postgres" в ClusterIP Service'а → kube-proxy на под PostgreSQL.
+
+**В7: Что будет, если БД `hotels_db` не существует?**
+> Spring Boot при первом подключении получит `FATAL: database "hotels_db" does not exist`. Приложение упадёт с `Failed to initialize JPA EntityManagerFactory`.
+> 
+> k8s увидит crash → перезапустит под → второй crash → третий → CrashLoopBackOff (экспоненциальная задержка между рестартами).
+> 
+> Решение:
+> 1. Init-скрипт в образе src-postgres создаёт все БД при первом запуске PostgreSQL.
+> 2. Liquibase / Flyway внутри hotel-service применяет миграции (создание таблиц).
+> 3. Init container в hotel-service может проверить наличие БД до старта.
+
+**В8: Как защитить hotel-service от прямого доступа в обход gateway?**
+> k8s даёт несколько уровней:
+> 
+> 1. **Service type: ClusterIP** (уже есть) — недоступен извне напрямую.
+> 2. **NetworkPolicy** — белый список: hotel-service принимает трафик ТОЛЬКО от подов с лейблом `app: gateway-service`:
+> ```yaml
+> apiVersion: networking.k8s.io/v1
+> kind: NetworkPolicy
+> spec:
+>   podSelector:
+>     matchLabels: { app: hotel-service }
+>   ingress:
+>     - from:
+>         - podSelector:
+>             matchLabels: { app: gateway-service }
+> ```
+> 3. **Service mesh** (Istio/Linkerd) — mTLS между сервисами, RBAC на уровне сервиса.
+> 4. **Внутренний JWT** между сервисами (как у нас GATEWAY_SERVICE_UUID).
+
+**В9: Что произойдёт, если запустить две реплики hotel-service с одной БД?**
+> Всё работает отлично! Это **stateless архитектура** во всей красе:
+> - Оба пода получают одинаковую конфигурацию.
+> - Оба коннектятся к одному PostgreSQL.
+> - Service балансирует round-robin: запрос 1 → pod 1, запрос 2 → pod 2, и т.д.
+> - PostgreSQL обрабатывает параллельные запросы (несколько коннектов).
+> 
+> Подводные камни:
+> - **Connection pool**: каждый под открывает свой пул (например, 10 коннектов) → суммарно 20 → может упереться в `max_connections` PostgreSQL (по умолчанию 100).
+> - **Кеш**: если в hotel-service есть локальный кеш в памяти (Caffeine, EhCache) — два пода будут иметь разные кеши. Решение: распределённый кеш (Redis) или принять eventual consistency.
+
+**В10: Какой namespace используется для всех ресурсов? Должны ли они быть в одном?**
+> Все ресурсы в `default` (namespace не указан → default).
+> 
+> Это работает, но не идеально. Правильнее:
+> ```yaml
+> metadata:
+>   namespace: booking-app
+> ```
+> Преимущества выделенного namespace:
+> 1. **Изоляция**: легко удалить весь проект `kubectl delete ns booking-app`.
+> 2. **RBAC**: можно дать команде права только на свой namespace.
+> 3. **Quota**: ResourceQuota на CPU/RAM для всего приложения.
+> 4. **NetworkPolicy**: проще писать правила по namespace.
+> 5. **Monitoring**: легче группировать метрики.
+> 
+> Для лабы default — приемлемо.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀
