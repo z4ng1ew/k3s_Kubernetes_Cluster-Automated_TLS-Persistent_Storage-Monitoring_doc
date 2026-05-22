@@ -1016,11 +1016,63 @@ s@Vivo:~/DO-11/src/manifests/k8s-app$ curl -k -H "Authorization: $TOKEN" \
 
 
 
+![alt text](<img/2/image copy 19.png>)
 
 
 
+```
+s@Vivo:~/DO-11/src$ cd ~/DO-11/src
 
+newman run application_tests.k8s.postman_collection.json \
+  --insecure \
+  --reporters cli,htmlextra \
+  --reporter-htmlextra-export newman-report.html \
+  --reporter-htmlextra-title "DO11 K8s Application Tests"
+newman
 
+Application Tests
+
+→ Login User
+  GET https://session.10.174.8.95.nip.io:443/api/v1/auth/authorize [200 OK, 952B, 809ms]
+  ✓  Login as a regular user
+
+→ Get Hotles
+  GET https://gateway.10.174.8.95.nip.io:443/api/v1/gateway/hotels [200 OK, 944B, 716ms]
+  ✓  Get hotels info
+
+→ Get Hotel
+  GET https://gateway.10.174.8.95.nip.io:443/api/v1/gateway/hotels/9d05ba36-bf8d-11eb-8529-0242ac130003 [200 OK, 630B, 96ms]
+  ✓  Get hotels info
+
+→ Book Hotel
+  POST https://gateway.10.174.8.95.nip.io:443/api/v1/gateway/booking [201 Created, 439B, 6.5s]
+  ✓  Book hotel
+
+→ Get User's Loyalty Balance
+  GET https://gateway.10.174.8.95.nip.io:443/api/v1/gateway/loyalty [200 OK, 509B, 105ms]
+  ✓  Get user's loyalty balance
+
+┌─────────────────────────┬────────────────────┬───────────────────┐
+│                         │           executed │            failed │
+├─────────────────────────┼────────────────────┼───────────────────┤
+│              iterations │                  1 │                 0 │
+├─────────────────────────┼────────────────────┼───────────────────┤
+│                requests │                  5 │                 0 │
+├─────────────────────────┼────────────────────┼───────────────────┤
+│            test-scripts │                 10 │                 0 │
+├─────────────────────────┼────────────────────┼───────────────────┤
+│      prerequest-scripts │                  5 │                 0 │
+├─────────────────────────┼────────────────────┼───────────────────┤
+│              assertions │                  5 │                 0 │
+├─────────────────────────┴────────────────────┴───────────────────┤
+│ total run duration: 8.4s                                         │
+├──────────────────────────────────────────────────────────────────┤
+│ total data received: 658B (approx)                               │
+├──────────────────────────────────────────────────────────────────┤
+│ average response time: 1660ms [min: 96ms, max: 6.5s, s.d.: 2.4s] │
+└──────────────────────────────────────────────────────────────────┘
+s@Vivo:~/DO-11/src$ 
+```
 
 
 
