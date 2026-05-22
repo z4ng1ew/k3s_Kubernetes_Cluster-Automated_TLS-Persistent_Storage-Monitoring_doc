@@ -1019,6 +1019,7 @@ s@Vivo:~/DO-11/src/manifests/k8s-app$ curl -k -H "Authorization: $TOKEN" \
 ![alt text](<img/2/image copy 19.png>)
 
 
+**результаты - 200/201**
 
 ```
 s@Vivo:~/DO-11/src$ cd ~/DO-11/src
@@ -1077,6 +1078,9 @@ s@Vivo:~/DO-11/src$
 
 
 
+![alt text](<img/2/image copy 20.png>)
+
+newman-reporter-htmlextra — это дополнительный плагин для красивых HTML-отчётов. Они выглядят гораздо лучше, чем стандартный вывод Newman, и отлично смотрятся в отчёте
 
 
 <br>
