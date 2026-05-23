@@ -4,3 +4,645 @@
           xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 
                               https://maven.apache.org/xsd/settings-1.0.0.xsd">
 </settings>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 📝 Построчный разбор maven-settings.xml
+
+## 🔍 Полный комментарий по каждой строке
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- XML-декларация. ОБЯЗАТЕЛЬНАЯ первая строка любого XML-файла.
+     
+     version="1.0":  версия XML-спецификации.
+                     Других версий de facto не используется.
+     
+     encoding="UTF-8": кодировка содержимого файла.
+                       UTF-8 — стандарт для Maven (поддерживает
+                       любые языки, включая русские комментарии
+                       и имена). Если кодировка не указана —
+                       парсер использует UTF-8 по умолчанию,
+                       но явность лучше.
+     
+     ⚠️ Если поставить, например, encoding="windows-1251",
+     а в файле есть UTF-8 символы — Maven выдаст ошибку
+     парсинга XML. -->
+
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 
+                              https://maven.apache.org/xsd/settings-1.0.0.xsd">
+<!-- Корневой элемент <settings>. Аналог "ROOT" документа.
+     
+     Атрибуты — это XML namespace declarations, нужны для
+     валидации схемы. Разберём каждый:
+     
+     ┌─────────────────────────────────────────────────┐
+     │ xmlns="http://maven.apache.org/SETTINGS/1.0.0"  │
+     └─────────────────────────────────────────────────┘
+     Default namespace для всех элементов внутри <settings>.
+     Это URI, идентифицирующий пространство имён Maven Settings.
+     
+     ⚠️ Важно: это НЕ ссылка, по которой что-то скачивается!
+     Это просто уникальный идентификатор (URI ≠ URL).
+     URI может быть нерабочим, Maven всё равно его понимает.
+     
+     Без этого namespace Maven не поймёт, какие элементы
+     являются Settings-элементами (servers, profiles, и т.д.),
+     а какие — пользовательскими расширениями.
+     
+     ┌─────────────────────────────────────────────────────┐
+     │ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"│
+     └─────────────────────────────────────────────────────┘
+     Определяет prefix "xsi" для XML Schema Instance namespace.
+     Это служебный namespace для атрибутов валидации (xsi:type,
+     xsi:schemaLocation, xsi:nil).
+     
+     В нашем файле используется только в следующей строке
+     (xsi:schemaLocation).
+     
+     ┌──────────────────────────────────────────────────────┐
+     │ xsi:schemaLocation="...settings/1.0.0                │
+     │                     ...settings-1.0.0.xsd"           │
+     └──────────────────────────────────────────────────────┘
+     Указывает XSD-схему для валидации этого XML.
+     Формат: пары "namespace URI" + "schema URL".
+     
+     Что значит:
+       Когда видишь элементы из namespace 
+       "http://maven.apache.org/SETTINGS/1.0.0",
+       валидируй их по схеме, доступной по URL
+       "https://maven.apache.org/xsd/settings-1.0.0.xsd".
+     
+     ⚠️ Maven НЕ скачивает эту схему при работе!
+     Это информация для IDE (IntelliJ, Eclipse, VS Code) —
+     они подсветят ошибки в settings.xml, автодополнение,
+     и т.д. Maven использует встроенный парсер. -->
+
+</settings>
+<!-- Закрытие корневого элемента.
+     
+     ВНУТРИ ПУСТО! Это критически важно.
+     
+     ⚠️ Это не "сломанный" или "недописанный" файл.
+     Это абсолютно валидный Maven settings.xml,
+     означающий: "Используй ВСЕ настройки по умолчанию,
+     ничего не переопределяй".
+     
+     Что Maven делает с таким файлом:
+     - Зависимости качаются с Maven Central
+       (https://repo.maven.apache.org/maven2/).
+     - Локальный кеш в ~/.m2/repository/.
+     - Никаких прокси.
+     - Никаких приватных репозиториев.
+     - Никаких credentials.
+     - Стандартные плагины. -->
+```
+
+---
+
+## 🤔 Почему файл пустой?
+
+Это **главный вопрос** при защите. Разберёмся.
+
+### Зачем тогда вообще файл нужен?
+
+Без файла Maven использовал бы дефолтный путь `~/.m2/settings.xml`. Если такого нет — settings вообще не применяются.
+
+В Dockerfile:
+```dockerfile
+COPY maven-settings.xml /root/.m2/settings.xml
+```
+
+Это **гарантирует**, что Maven использует **наш** settings.xml, а не какой-то унаследованный из базового образа.
+
+**Сценарии**, в которых пустой settings.xml полезен:
+
+1. **Перезатереть кастомный settings.xml в базовом образе**.
+   Образ `maven:3.9-eclipse-temurin-11` может иметь свой settings.xml с настройками, которые нам не нужны.
+
+2. **Stub-файл для будущего расширения**.
+   Сегодня — пусто. Завтра можно добавить mirror, прокси, серверы без изменения Dockerfile.
+
+3. **Демонстрация структуры**.
+   Документирующая роль: "вот где должны быть настройки Maven, если они вам понадобятся".
+
+4. **CI/CD среды**.
+   В разных средах (dev/stage/prod) могут понадобиться разные settings.xml. Сейчас все одинаковые → пустые.
+
+---
+
+## 📚 Что может быть в settings.xml
+
+Покажу типичные секции, которые могли бы здесь быть:
+
+```xml
+<settings>
+    <!-- 1. ЛОКАЛЬНЫЙ РЕПОЗИТОРИЙ -->
+    <localRepository>/custom/path/to/.m2</localRepository>
+    <!-- По умолчанию: ~/.m2/repository -->
+    
+    <!-- 2. ИНТЕРАКТИВНОСТЬ -->
+    <interactiveMode>false</interactiveMode>
+    <!-- В CI: false. По умолчанию: true. -->
+    
+    <!-- 3. OFFLINE РЕЖИМ -->
+    <offline>false</offline>
+    <!-- Если true: Maven работает только с локальным кешем. -->
+    
+    <!-- 4. ПЛАГИНЫ, ГРУППЫ И ВЕРСИИ -->
+    <pluginGroups>
+        <pluginGroup>org.springframework.boot</pluginGroup>
+    </pluginGroups>
+    
+    <!-- 5. ПРОКСИ -->
+    <proxies>
+        <proxy>
+            <id>corporate-proxy</id>
+            <active>true</active>
+            <protocol>http</protocol>
+            <host>proxy.company.com</host>
+            <port>8080</port>
+            <username>user</username>
+            <password>secret</password>
+            <nonProxyHosts>*.company.com</nonProxyHosts>
+        </proxy>
+    </proxies>
+    
+    <!-- 6. СЕРВЕРЫ (credentials) -->
+    <servers>
+        <server>
+            <id>nexus-releases</id>
+            <username>admin</username>
+            <password>secret</password>
+        </server>
+        <server>
+            <id>github-packages</id>
+            <username>${env.GITHUB_USERNAME}</username>
+            <password>${env.GITHUB_TOKEN}</password>
+        </server>
+    </servers>
+    
+    <!-- 7. MIRROR (зеркала репозиториев) -->
+    <mirrors>
+        <mirror>
+            <id>nexus-mirror</id>
+            <mirrorOf>central</mirrorOf>
+            <url>https://nexus.company.com/repository/maven-central/</url>
+        </mirror>
+        <mirror>
+            <id>school21-mirror</id>
+            <mirrorOf>*</mirrorOf>
+            <url>https://nexus.school21.ru/repository/maven-public/</url>
+        </mirror>
+    </mirrors>
+    
+    <!-- 8. ПРОФИЛИ (профили активации) -->
+    <profiles>
+        <profile>
+            <id>development</id>
+            <repositories>
+                <repository>
+                    <id>my-private-repo</id>
+                    <url>https://repo.private.com/maven</url>
+                </repository>
+            </repositories>
+        </profile>
+    </profiles>
+    
+    <!-- 9. АКТИВНЫЕ ПРОФИЛИ -->
+    <activeProfiles>
+        <activeProfile>development</activeProfile>
+    </activeProfiles>
+</settings>
+```
+
+В нашем минимальном файле **ничего из этого нет** — Maven использует все дефолты.
+
+---
+
+## 🔄 Как Maven применяет настройки
+
+При запуске Maven использует ДВА уровня settings.xml:
+
+```
+1. GLOBAL settings (для всех пользователей):
+   $MAVEN_HOME/conf/settings.xml
+   
+   Обычно: пусто или дефолт.
+
+2. USER settings (для конкретного пользователя):
+   ~/.m2/settings.xml
+   ← наш файл!
+
+Логика мержа:
+- Если параметр есть в USER → используется он.
+- Иначе → берётся из GLOBAL.
+- Иначе → дефолт Maven.
+```
+
+В Docker-контейнере:
+- `MAVEN_HOME` = `/usr/share/maven/` (в образе maven:3.9).
+- Global settings в `/usr/share/maven/conf/settings.xml` (дефолт).
+- User settings — наш файл в `/root/.m2/settings.xml`.
+
+Пустой user settings = "не переопределяй ничего, всё бери из global или дефолтов".
+
+---
+
+## 🌐 Дефолтное поведение без явных настроек
+
+С пустым settings.xml Maven делает следующее:
+
+```
+1. Локальный кеш зависимостей:
+   ~/.m2/repository/  (в контейнере: /root/.m2/repository/)
+
+2. Центральный репозиторий:
+   https://repo.maven.apache.org/maven2/
+
+3. Скачивание зависимостей:
+   - При mvn package: проверяет pom.xml.
+   - Для каждой зависимости:
+     a) Ищет в локальном ~/.m2/repository/.
+     b) Если нет → качает с Maven Central.
+     c) Сохраняет в локальный кеш.
+   - Учитывает <repositories> из pom.xml (если есть).
+
+4. Прокси: нет.
+
+5. Аутентификация: только для репозиториев, требующих auth
+   (если в settings.xml нет <server> блока).
+
+6. Профили: не активирован ни один.
+
+7. Mirror: нет, все запросы напрямую.
+```
+
+Для нашего учебного проекта этого **достаточно**: pom.xml тянет Spring Boot из Maven Central, никакой авторизации не нужно.
+
+---
+
+## 🆚 Сравнение: пустой vs наполненный settings.xml
+
+### Сценарий 1: Учебный проект (наш)
+```xml
+<settings xmlns="...">
+</settings>
+```
+- ✅ Просто.
+- ✅ Maven Central работает напрямую.
+- ❌ Не подходит за корпоративным прокси.
+- ❌ Не работает с приватными репозиториями.
+
+### Сценарий 2: Корпоративная разработка
+```xml
+<settings>
+    <mirrors>
+        <mirror>
+            <id>nexus</id>
+            <mirrorOf>*</mirrorOf>
+            <url>https://nexus.company.com/maven</url>
+        </mirror>
+    </mirrors>
+    <servers>
+        <server>
+            <id>nexus</id>
+            <username>${env.NEXUS_USER}</username>
+            <password>${env.NEXUS_PASSWORD}</password>
+        </server>
+    </servers>
+</settings>
+```
+- ✅ Все запросы идут через корпоративный Nexus.
+- ✅ Кеширование на стороне Nexus → быстрее.
+- ✅ Контроль безопасности (только одобренные библиотеки).
+
+### Сценарий 3: CI/CD с приватным GitHub Packages
+```xml
+<settings>
+    <servers>
+        <server>
+            <id>github</id>
+            <username>${env.GITHUB_ACTOR}</username>
+            <password>${env.GITHUB_TOKEN}</password>
+        </server>
+    </servers>
+</settings>
+```
+
+---
+
+## 🎯 Что насчёт MAVEN_OPTS в Dockerfile?
+
+В Dockerfile gateway-service есть:
+```dockerfile
+ENV MAVEN_OPTS="-Dmaven.wagon.http.pool=false ..."
+```
+
+**Связь с settings.xml**:
+- `MAVEN_OPTS` — это **JVM-флаги** для процесса Maven.
+- `settings.xml` — это **конфигурация** Maven.
+- Они работают на разных уровнях, не конфликтуют.
+
+`MAVEN_OPTS` мог бы быть прописан и в settings.xml через профили, но это менее гибко. ENV в Dockerfile удобнее для CI/CD.
+
+---
+
+## 🗣 Монолог для защиты (~300 символов)
+
+> Это минимальный maven-settings.xml: только XML-декларация и пустой корневой элемент settings с namespace для валидации схемы. Файл сознательно пустой — Maven использует все дефолты: зависимости качаются с Maven Central, локальный кеш в ~/.m2/repository, никаких прокси и приватных репозиториев. Файл копируется в Dockerfile для перезаписи кастомных настроек из базового образа maven:3.9.
+
+*(длина ~400 символов, могу сократить до 300)*
+
+---
+
+## 💡 Возможные вопросы на защите
+
+**В1: Зачем нужен пустой файл, если ничего не настраивает?**
+> Несколько причин:
+> 
+> 1. **Гарантированный override**: базовый образ `maven:3.9-eclipse-temurin-11` может содержать свой settings.xml в `/usr/share/maven/conf/`. Наш пустой файл в `/root/.m2/settings.xml` перезаписывает user-level настройки, гарантируя предсказуемое поведение.
+> 
+> 2. **Stub для будущего расширения**: сегодня файл пустой, завтра в него можно добавить mirror, прокси, credentials без изменения Dockerfile. Это упрощает evolution проекта.
+> 
+> 3. **Документирующая роль**: явно показывает, что Maven использует дефолты. Любой разработчик, открыв файл, понимает: "никаких кастомных настроек".
+> 
+> 4. **CI/CD совместимость**: в разных средах (dev/stage/prod) можно подменить этот файл через volume mount или COPY, без правки Dockerfile.
+
+**В2: Что произойдёт, если убрать COPY maven-settings.xml из Dockerfile?**
+> Maven будет использовать **дефолтный** settings.xml из базового образа Maven, который находится в `/usr/share/maven/conf/settings.xml` (global settings).
+> 
+> В базовом образе `maven:3.9-eclipse-temurin-11` он тоже минимальный:
+> ```xml
+> <settings>
+>   <pluginGroups/>
+>   <proxies/>
+>   <servers/>
+>   <mirrors/>
+>   <profiles/>
+> </settings>
+> ```
+> 
+> Так что в нашем случае всё равно работало бы. Но:
+> - Не было бы user-level settings.xml.
+> - При попытке добавить кастомизации (например, для приватного репозитория) пришлось бы создавать settings.xml с нуля.
+> - В production-проектах часто есть user-settings с кредами — пустой файл "защищает" от наследования этих credentials из dev-машины.
+
+**В3: Какие XML-namespaces используются и зачем?**
+> Два namespace:
+> 
+> 1. **`xmlns="http://maven.apache.org/SETTINGS/1.0.0"`** — default namespace.
+>    Все элементы внутри `<settings>` (servers, mirrors, profiles) автоматически принадлежат этому namespace. Maven определяет, что это его XML, по этому URI.
+>    
+>    ⚠️ URI ≠ URL: это идентификатор пространства имён, не ссылка, по которой что-то скачивается.
+> 
+> 2. **`xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"`** — XSI namespace.
+>    Стандартный namespace для атрибутов валидации XML-схемы. Нужен только для `xsi:schemaLocation` в следующем атрибуте.
+> 
+> `xsi:schemaLocation` — указывает URL XSD-схемы для валидации. **Maven НЕ скачивает её при работе** — это информация для IDE (IntelliJ, VS Code). Они подсвечивают ошибки, автодополнение, и т.д.
+
+**В4: Можно ли убрать namespace-атрибуты и оставить просто `<settings>`?**
+> Да, технически Maven и без них всё разберёт. Он использует **lax parsing**: ищет элементы по имени, namespace необязателен.
+> 
+> Но:
+> - **IDE-валидация** не будет работать без `xsi:schemaLocation`.
+> - **Best practice**: следовать стандарту, особенно в production.
+> - **Maven documentation**: рекомендует указывать namespace.
+> 
+> В нашем случае атрибуты — это "цивилизованная" форма settings.xml, даже если контент пустой.
+
+**В5: Где Maven по умолчанию ищет зависимости?**
+> При пустом settings.xml Maven использует Maven Central:
+> ```
+> https://repo.maven.apache.org/maven2/
+> ```
+> 
+> Алгоритм поиска:
+> 1. Проверяет локальный кеш `~/.m2/repository/`.
+> 2. Если нет → Maven Central.
+> 3. Если в pom.xml указаны дополнительные `<repositories>` → тоже их.
+> 4. В дополнение к Central, проверяет, есть ли mirror в settings.xml (нет в нашем случае).
+> 
+> Для Spring Boot всё, что нужно, есть в Maven Central. Никаких приватных репозиториев не требуется.
+
+**В6: Что будет, если за корпоративным прокси?**
+> Maven не сможет подключиться к Maven Central → сборка упадёт с:
+> ```
+> Could not transfer artifact ... from/to central
+> (https://repo.maven.apache.org/maven2):
+> Connection timed out
+> ```
+> 
+> Решение — добавить в settings.xml:
+> ```xml
+> <proxies>
+>   <proxy>
+>     <id>corp-proxy</id>
+>     <active>true</active>
+>     <protocol>http</protocol>
+>     <host>proxy.company.com</host>
+>     <port>8080</port>
+>     <username>user</username>
+>     <password>pass</password>
+>   </proxy>
+> </proxies>
+> ```
+> 
+> Или альтернативы:
+> - Передать через `MAVEN_OPTS`:
+>   ```bash
+>   MAVEN_OPTS="-Dhttp.proxyHost=proxy.company.com -Dhttp.proxyPort=8080"
+>   ```
+> - Использовать корпоративный Nexus как mirror.
+
+**В7: Можно ли использовать переменные окружения в settings.xml?**
+> Да, через синтаксис `${env.VAR_NAME}`:
+> ```xml
+> <servers>
+>   <server>
+>     <id>github</id>
+>     <username>${env.GITHUB_USER}</username>
+>     <password>${env.GITHUB_TOKEN}</password>
+>   </server>
+> </servers>
+> ```
+> 
+> Это **обязательно** для безопасности: не нужно класть пароли прямо в settings.xml (который может попасть в git!).
+> 
+> Альтернативы:
+> - `${system.property.name}` — JVM system properties.
+> - `${settings.localRepository}` — другие настройки settings.xml.
+> - `${user.home}` — стандартные Java properties.
+
+**В8: Что такое mirror и чем он отличается от repository?**
+> **Repository** — это место, ГДЕ лежат артефакты. В pom.xml:
+> ```xml
+> <repositories>
+>   <repository>
+>     <id>central</id>
+>     <url>https://repo.maven.apache.org/maven2/</url>
+>   </repository>
+> </repositories>
+> ```
+> 
+> **Mirror** — это **перенаправление** запросов от одного repository к другому. В settings.xml:
+> ```xml
+> <mirrors>
+>   <mirror>
+>     <id>nexus</id>
+>     <mirrorOf>central</mirrorOf>  ← перехватывает запросы к "central"
+>     <url>https://nexus.company.com/maven</url>
+>   </mirror>
+> </mirrors>
+> ```
+> 
+> Логика: pom.xml говорит "нужно с central", mirror говорит "нет, бери с моего URL".
+> 
+> Зачем mirror:
+> - **Корпоративный кеш** (Nexus, Artifactory): один раз скачать → раздать всем разработчикам.
+> - **Контроль безопасности**: только проверенные библиотеки.
+> - **Скорость**: локальный mirror быстрее интернета.
+> - **Independence**: работа без интернета (если mirror закеширован).
+
+**В9: Можно ли иметь несколько settings.xml в проекте?**
+> Maven поддерживает только **два уровня**:
+> 1. Global: `$MAVEN_HOME/conf/settings.xml` (один на установку).
+> 2. User: `~/.m2/settings.xml` (один на пользователя).
+> 
+> В проекте (pom.xml) — нет settings.xml, только конфигурация плагинов.
+> 
+> Альтернативы для разных окружений:
+> - **Профили** в settings.xml: разные настройки активируются по флагу `-P`.
+> - **Через CLI**: `mvn -s custom-settings.xml package`.
+> - **CI/CD**: разные settings.xml монтируются в зависимости от среды.
+> 
+> Часто используется паттерн:
+> ```
+> project/
+>   ├── settings-dev.xml
+>   ├── settings-prod.xml
+>   └── Dockerfile (выбирает нужный)
+> ```
+
+**В10: Почему именно schema 1.0.0, а не более новая?**
+> Maven использует семантику XSD-версий, но **`1.0.0` — единственная актуальная для settings.xml**! 
+> 
+> Это **намеренное решение Maven**: формат settings.xml стабилен с версии Maven 2.0 (2005). Все изменения backward-compatible, новой схемы не выпускали. Это в отличие от pom.xml, где была 4.0.0, а сейчас вводят 4.1.0.
+> 
+> Использование `1.0.0` обеспечивает совместимость со всеми версиями Maven (3.x, 4.x).
+
+**В11: Безопасно ли коммитить settings.xml в git?**
+> **Зависит от содержимого**:
+> 
+> **Можно коммитить**:
+> - Пустой settings.xml (как наш).
+> - Settings.xml с публичными mirror'ами без credentials.
+> - Settings.xml с `${env.VAR}` placeholders для credentials.
+> 
+> **НЕЛЬЗЯ коммитить**:
+> - Settings.xml с paroles прямо в XML:
+>   ```xml
+>   <password>secret123</password>  ← НИКОГДА в git!
+>   ```
+> 
+> Защита:
+> - `.gitignore` для local settings.
+> - Use `${env.PASSWORD}` placeholders.
+> - Maven password encryption (`mvn -ep`):
+>   ```bash
+>   mvn --encrypt-password mySecret
+>   # → {COQLCE6DU6GtcS5P=}
+>   ```
+>   Зашифрованный пароль кладётся в settings.xml, master-password в `~/.m2/settings-security.xml`.
+
+**В12: Что произойдёт без xsi:schemaLocation?**
+> Файл **продолжит работать**:
+> ```xml
+> <?xml version="1.0" encoding="UTF-8"?>
+> <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+> </settings>
+> ```
+> 
+> Что потеряется:
+> 1. **IDE-валидация**: IntelliJ/Eclipse не подскажет ошибки в structure.
+> 2. **Автодополнение**: при наборе `<ser` IDE не предложит `<servers>`.
+> 3. **XSD-проверка** через xmllint или другие инструменты.
+> 
+> Maven сам **не валидирует** по этой схеме. Он использует встроенный парсер с lax-режимом.
+> 
+> Так что `xsi:schemaLocation` — это **подсказка для tooling**, не функциональное требование. Но best practice — включать.
+
+**В13: Зачем `encoding="UTF-8"` в декларации?**
+> XML-парсеры используют разные дефолтные кодировки. Чтобы избежать недоразумений, явно указываем UTF-8.
+> 
+> Без encoding:
+> - Парсер пытается detect по BOM или содержимому.
+> - Если в файле русские/китайские/арабские символы (например, в `<description>`), может неправильно прочитать.
+> - В Windows-средах parser может попытаться использовать cp1251, и сборка упадёт с XML parsing error.
+> 
+> С `encoding="UTF-8"`:
+> - Однозначное указание: содержимое в UTF-8.
+> - Защита от ошибок на разных платформах.
+> - Поддержка любых языков.
+> 
+> Для Maven settings.xml это особенно важно: в `<server><password>` могут быть спецсимволы (хотя лучше через placeholders).
+
+**В14: Чем отличается этот файл от того, что нужно в production?**
+> Текущий — минимальный, для учебного проекта. В production обычно есть:
+> 
+> 1. **Корпоративный mirror**:
+> ```xml
+> <mirrors>
+>   <mirror>
+>     <id>company-nexus</id>
+>     <mirrorOf>*</mirrorOf>
+>     <url>https://nexus.company.com/maven</url>
+>   </mirror>
+> </mirrors>
+> ```
+> 
+> 2. **Credentials через env**:
+> ```xml
+> <servers>
+>   <server>
+>     <id>company-nexus</id>
+>     <username>${env.NEXUS_USER}</username>
+>     <password>${env.NEXUS_PASSWORD}</password>
+>   </server>
+> </servers>
+> ```
+> 
+> 3. **Encrypted passwords**:
+> ```xml
+> <password>{COQLCE6DU6GtcS5P=}</password>
+> ```
+> 
+> 4. **Профили для разных сред**:
+> ```xml
+> <profiles>
+>   <profile>
+>     <id>internal</id>
+>     <repositories>...</repositories>
+>   </profile>
+> </profiles>
+> ```
+> 
+> Сейчас всё это не нужно: открытый проект, Maven Central работает, нет приватных артефактов.
+
+Если по какой-то строке хочется глубже — спрашивай 🚀
